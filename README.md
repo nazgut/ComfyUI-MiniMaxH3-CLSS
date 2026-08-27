@@ -22,16 +22,28 @@ CLSS treats the chunk hand-off as a **feedback loop** and controls it. Chunks sh
 
 Note: H3's RoPE t-origin sits after the text span, so a scene's text is reused verbatim across its chunks (position stability); the crossfade blends only at boundaries.
 
+**Prompt format matters.** H3 (and the ClipProj projection) is calibrated on MiniMax's
+structured six-section format: `subject_definitions:` / `summary:` /
+`detailed_description:` / `[Shot N] timecode-timecode.` / `overall_soundscape:` /
+`non_diegetic_music:`. Long free-form prose measurably degrades output. Each CLSS scene
+block must carry the full structure (a chunk window only ever sees its own scene's
+text); keep each block under ~400 words. The canonical workflow's 3-scene Ferrari
+prompt is written in this format — copy its shape.
+
 ## Model files
 
 From `Comfy-Org/MiniMax-H3` on Hugging Face:
 
 | File | Place in |
 |---|---|
-| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `models/diffusion_models/` |
-| `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `models/text_encoders/` |
+| `minimax_h3_fl2va_int8_convrot.safetensors` | `models/diffusion_models/` |
 | `minimax_h3_video_vae_fp16.safetensors` | `models/vae/` |
 | `minimax_h3_audio_vae_fp32.safetensors` | `models/vae/` |
+
+Text encoder — two options:
+
+- **Small (recommended for 16 GB cards):** the [ComfyUI-ClipProj](https://github.com/NicoLab28) pack's `ClipProjLoader` with a Qwen3-VL-4B (`qwen3vl_4b_fp8_scaled.safetensors`, `models/text_encoders/`) + learned projection (`mmh3-4b-ClipProj-v3.1.safetensors`, `models/clip_projections/`). ~5.5 GB instead of 15.7 GB; the canonical workflow uses this.
+- **Stock:** `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` via `CLIPLoader` (type `minimax`) — swap node 4 in the workflow if you prefer the full 32B encoder.
 
 Requires ComfyUI ≥ 0.30 with native MiniMax H3 support (nodes `EmptyMiniMaxH3LatentAV` etc.).
 

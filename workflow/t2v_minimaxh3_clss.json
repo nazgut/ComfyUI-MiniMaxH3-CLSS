@@ -1,143 +1,239 @@
 {
   "1": {
     "inputs": {
-      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
     },
     "class_type": "VAELoader",
-    "_meta": { "title": "Load Video VAE (H3)" }
+    "_meta": {
+      "title": "Load Video VAE (H3)"
+    }
   },
   "2": {
     "inputs": {
-      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+      "vae_name": "minimax_h3_audio_vae_bf16.safetensors"
     },
     "class_type": "VAELoader",
-    "_meta": { "title": "Load Audio VAE (H3)" }
+    "_meta": {
+      "title": "Load Audio VAE (H3)"
+    }
   },
   "3": {
     "inputs": {
-      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "unet_name": "minimax_h3_ref2va_hybrid_b20-49_pruned_w4a8_mixed.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
-    "_meta": { "title": "Load Diffusion Model" }
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
   },
   "4": {
     "inputs": {
-      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-      "type": "minimax"
+      "clip_name": "qwen3vl_4b_int4_convrot.safetensors",
+      "type": "auto",
+      "projection": "mmh3-4b-ClipProj-v3.1-mlp.safetensors",
+      "device": "cuda:0",
+      "mode": "resident"
     },
-    "class_type": "CLIPLoader",
-    "_meta": { "title": "Load CLIP (qwen3vl)" }
+    "class_type": "ClipProjLoader",
+    "_meta": {
+      "title": "ClipProj: 4B encoder + projection (replaces 15.7 GB 32B)"
+    }
   },
   "5": {
     "inputs": {
-      "clip": ["4", 0],
-      "prompts": "From the driver's first-person perspective, a classic red vintage Ferrari convertible hugs the winding Pacific Coast Highway, its glossy hood and chrome grille leading the view as the car glides through a gentle right-hand curve. The driver's tanned hands grip the black leather steering wheel at ten and two, fingers tapping rhythmically as the asphalt rushes beneath the open hood. The bright white dashboard gauges and the wind buffeting the windshield frame fill the immediate foreground, while the steering wheel slightly rotates with each turn. Through the curved glass, the deep blue Pacific Ocean sparkles intensely to the right, with whitecaps breaking against scattered rocks just offshore, while dry golden-brown hills rise steeply on the left, dotted with green coastal scrub. A fixed, eye-level POV camera is mounted just behind the steering wheel, looking straight ahead over the hood, perfectly framing the road's center line as it unfurls toward the horizon. Late afternoon golden hour light pours through the windshield, casting warm orange and yellow glare across the polished chrome and leather, with long shadows stretching from the front wheels. Audio is radio song playing classic 90' song in high quality with no artifacts and no noise. The steering wheel completes its subtle rotation back to center as the road straightens out, the Ferrari's chrome hood emblem now perfectly aligned with the vanishing point, where the dramatic coastal cliffs begin to visibly recede and flatten into a low, hazy coastal plain just ahead.\n---\nThe steering wheel completes its subtle rotation back to center as the road straightens out, the Ferrari's chrome hood emblem now perfectly aligned with the vanishing point, where the dramatic coastal cliffs begin to visibly recede and flatten into a low, hazy coastal plain just ahead. The driver's right hand lifts briefly from the wheel to adjust the rearview mirror, momentarily obscuring the left side of the frame with a black leather glove, before returning firmly to the ten-and-two position. The car accelerates smoothly, the tachometer needle on the white dashboard swinging upward as the engine's deep roar intensifies. Through the windshield, the ocean view gradually shrinks to the right as the highway curves slightly inland, replacing the crashing waves with the first scattered clusters of whitewashed buildings and telephone poles lining the roadside. The dry golden hills on the left now show the distinct grid patterns of suburban development creeping up their lower slopes. The golden hour light grows warmer, deepening to a rich amber that bounces off the windshield, creating a strong lens flare that partially obscures the far-left lane. Audio remains the crisp 90's rock track from the radio, now layered with the rising pitch of the Ferrari's V12 engine and the increased whoosh of wind turbulence around the windshield frame. A large, reflective green highway sign looms directly into the center of the windshield, its bold white lettering clearly spelling the city's name and exit number, while its metal support pole casts a sharp, elongated shadow across the asphalt directly in front of the glowing red hood.\n---\nA large, reflective green highway sign looms directly into the center of the windshield, its bold white lettering clearly spelling the city's name and exit number, while its metal support pole casts a sharp, elongated shadow across the asphalt directly in front of the glowing red hood. The driver's left hand firmly turns the steering wheel to the right, the leather-wrapped rim sliding through the gloved fingers as the Ferrari smoothly veers onto the off-ramp. The camera tilts slightly with the lateral G-force, now showing the concrete barriers and merging lanes of the city approach in the foreground. The ocean vanishes entirely, replaced by a dense skyline of glass-and-steel high-rises that catch the last rays of the setting sun, creating a blinding mosaic of orange and pink reflections across every window. The car decelerates, the driver's right foot easing off the gas as the tachometer drops, and the first city traffic light appears ahead, its red glow vivid against the dusky blue sky. The immediate foreground is now filled with the Ferrari's glossy hood reflecting the city's grid of streetlights, with the driver's hands steadying the wheel as the road narrows into a multi-lane urban boulevard. Audio transforms from wind noise to the muffled, echoing roar of the V12 bouncing off nearby concrete walls and storefronts, with the radio song fading slightly beneath the urban reverberation. The Ferrari rolls to a complete, purring stop at the first city intersection, the view now perfectly framed by towering glass facades on both sides, the red traffic light dangling overhead, while the driver's gloved thumb taps impatiently against the leather wheel as a crosswalk signal ticks down its glowing white numbers directly ahead."
+      "prompts": "subject_definitions:\n<Driver> is a tanned middle-aged man; only his forearms and black-leather-gloved hands are visible, gripping the steering wheel at ten and two.\n<Ferrari> is a classic red vintage convertible with a glossy long hood, chrome grille and a chrome hood emblem, black leather interior and a white-gauged dashboard.\n<Coast> is a winding Pacific Coast highway: deep blue ocean with whitecaps and scattered rocks to the right, dry golden-brown hills with green coastal scrub to the left.\n\nsummary:\nA single continuous first-person driving shot from the driver's seat. No cuts, no transitions - one slow, smooth take. The <Ferrari> glides through a gentle right-hand curve, then the road straightens toward a hazy coastal plain.\n\ndetailed_description:\nCinematic live action, shot on 35mm film, golden hour late-afternoon light, fine natural grain. Warm orange and yellow glare pours through the windshield across polished chrome and leather; long shadows stretch from the front wheels. Fixed, eye-level POV camera mounted just behind the steering wheel, looking straight ahead over the hood, framing the road's center line.\n\n[Shot 1] 00:00.000-00:10.000. Fixed POV over the hood. The <Ferrari> enters a gentle right-hand curve; the steering wheel rotates subtly in the <Driver>'s gloved hands, fingers tapping rhythmically. Whitecaps break on the <Coast>'s offshore rocks to the right while golden hills slide past on the left. As the road straightens, the wheel returns to center and the chrome hood emblem aligns with the vanishing point, where cliffs recede into a low hazy plain.\n\noverall_soundscape:\nDiegetic only, continuous. A classic 90s rock song plays from the car radio in high quality, no artifacts, no noise; under it the smooth hum of the V12 engine and soft wind buffeting the windshield frame.\n\nnon_diegetic_music:\nN/A - no score; the only music is the diegetic car radio described above.\n",
+      "clip": [
+        "4",
+        0
+      ]
     },
     "class_type": "CLSSH3ScenePrompts",
-    "_meta": { "title": "CLSS H3 Scene Prompts (--- separated)" }
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (--- separated)"
+    }
   },
   "6": {
     "inputs": {
-      "clip": ["4", 0],
-      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX"
+      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX",
+      "clip": [
+        "4",
+        0
+      ]
     },
     "class_type": "CLSSH3ScenePrompts",
-    "_meta": { "title": "CLSS H3 Scene Prompts (negative)" }
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (negative)"
+    }
   },
   "7": {
     "inputs": {
-      "width": 1344,
-      "height": 768,
-      "length": 277
+      "width": 832,
+      "height": 480,
+      "length": 243
     },
     "class_type": "EmptyMiniMaxH3LatentAV",
-    "_meta": { "title": "Empty H3 AV Latent (per-chunk: 277 px ≈ 11.5 s)" }
+    "_meta": {
+      "title": "Empty H3 AV Latent (per-chunk: 243 px ≈ 10.1 s)"
+    }
   },
   "8": {
     "inputs": {
       "sampler_name": "res_multistep"
     },
     "class_type": "KSamplerSelect",
-    "_meta": { "title": "KSampler Select" }
+    "_meta": {
+      "title": "KSampler Select"
+    }
   },
   "9": {
     "inputs": {
-      "model": ["3", 0],
       "scheduler": "simple",
-      "steps": 20,
-      "denoise": 1.0
+      "steps": 12,
+      "denoise": 1,
+      "model": [
+        "16",
+        0
+      ]
     },
     "class_type": "BasicScheduler",
-    "_meta": { "title": "BasicScheduler" }
+    "_meta": {
+      "title": "BasicScheduler"
+    }
   },
   "10": {
     "inputs": {
-      "noise_seed": 123456789
+      "noise_seed": 605729501891549
     },
     "class_type": "RandomNoise",
-    "_meta": { "title": "RandomNoise" }
+    "_meta": {
+      "title": "RandomNoise"
+    }
   },
   "11": {
     "inputs": {
       "tau_c": 0.05,
       "beta": 0.4,
-      "overlap": 7,
-      "noise_temporal_corr": 0.3
+      "overlap": 8,
+      "noise_temporal_corr": 0
     },
     "class_type": "CLSSH3Config",
-    "_meta": { "title": "CLSS H3 Config" }
+    "_meta": {
+      "title": "CLSS H3 Config"
+    }
   },
   "12": {
     "inputs": {
-      "model": ["3", 0],
-      "positive": ["5", 0],
-      "negative": ["6", 0],
-      "video_cfg": 4.0,
-      "audio_cfg": 7.0,
-      "rescale": 0.7
+      "video_cfg": 1,
+      "audio_cfg": 4,
+      "rescale": 0.7,
+      "model": [
+        "16",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
     },
     "class_type": "CLSSH3Guider",
-    "_meta": { "title": "CLSS H3 Guider (Split AV CFG)" }
-  },
-  "13": {
-    "inputs": {
-      "guider": ["12", 0],
-      "sampler": ["8", 0],
-      "sigmas": ["9", 0],
-      "noise": ["10", 0],
-      "latent": ["7", 0],
-      "clss_config": ["11", 0],
-      "num_chunks": 6,
-      "fps": 24.0,
-      "detail_anchor": "on",
-      "video_slb_tau_mult": 1.0,
-      "audio_slb_tau_mult": -0.5,
-      "scene_handoff": "transition_chunk"
-    },
-    "class_type": "CLSSH3StreamingSampler",
-    "_meta": { "title": "CLSS H3 Streaming Sampler (6 chunks ≈ 65 s)" }
+    "_meta": {
+      "title": "CLSS H3 Guider (Split AV CFG)"
+    }
   },
   "14": {
     "inputs": {
-      "vae": ["1", 0],
-      "audio_vae": ["2", 0],
-      "latent": ["13", 0],
       "filename_prefix": "clss_h3/CLSSH3_frame_",
       "frames_per_slice": 27,
-      "context_frames": 2,
-      "fps": 24.0
+      "context_frames": 0,
+      "fps": 24,
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "22",
+        0
+      ]
     },
     "class_type": "CLSSH3VideoDecodeSave",
-    "_meta": { "title": "CLSS H3 Video Decode+Save (streaming)" }
+    "_meta": {
+      "title": "CLSS H3 Video Decode+Save (streaming)"
+    }
   },
   "15": {
     "inputs": {
       "filename_prefix": "audio/CLSSH3",
       "format": "flac",
-      "audio": ["14", 0]
+      "audio": [
+        "14",
+        0
+      ]
     },
     "class_type": "SaveAudioAdvanced",
-    "_meta": { "title": "Save Audio" }
+    "_meta": {
+      "title": "Save Audio"
+    }
+  },
+  "16": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "MiniMaxH3 Sigma Shift"
+    }
+  },
+  "22": {
+    "inputs": {
+      "num_chunks": 2,
+      "fps": 24,
+      "detail_anchor": "on",
+      "video_slb_tau_mult": 1,
+      "audio_slb_tau_mult": 1,
+      "audio_guide_seconds": 1,
+      "scene_handoff": "hard",
+      "guider": [
+        "12",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "noise": [
+        "10",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ],
+      "clss_config": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "CLSSH3StreamingSampler",
+    "_meta": {
+      "title": "CLSS H3 Streaming Sampler (6 chunks ≈ 56 s)"
+    }
   }
 }
