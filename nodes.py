@@ -304,6 +304,38 @@ def _tau_c_eff(base: float, ceiling: float, chunk_idx: int, half_life: float = 5
     return ceiling - (ceiling - base) * decay
 
 
+_GUIDE_LAYOUT_CHECKED = False
+
+
+def _check_guide_layout() -> None:
+    """The end-aligned audio guide needs a fractional, NEGATIVE
+    resolved_frame_index to be taken literally by PackedLayout
+    (cond_t = cursor + FRAME_RESCALE * index).  ComfyUI < 0.34's layout
+    (constructor still takes frame_count) rejected any keyframe anchor
+    other than the first/last frame, so on it the guide would land at the
+    wrong instant or fail deep inside the model.  Fail loudly with the
+    fix instead (the H3-Motion-Context pack's layout_contract does the
+    full behavioural proof; the signature check covers the one breaking
+    upstream change known to matter here)."""
+    global _GUIDE_LAYOUT_CHECKED
+    if _GUIDE_LAYOUT_CHECKED:
+        return
+    import inspect
+    from comfy.ldm.minimax.model import PackedLayout
+    try:
+        params = inspect.signature(PackedLayout.__init__).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "frame_count" in params:
+        raise RuntimeError(
+            "[CLSS] audio_guide_seconds > 0 needs ComfyUI 0.34.0 or newer: "
+            "this ComfyUI's PackedLayout still takes frame_count and only "
+            "accepts first/last-frame keyframe anchors, so the guide's "
+            "fractional negative index would not be honoured. Update "
+            "ComfyUI, or set audio_guide_seconds to 0.")
+    _GUIDE_LAYOUT_CHECKED = True
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -600,11 +632,11 @@ class CLSSH3StreamingSampler:
                 # 0 = SLB placed fully frozen, > 0 = SLB re-noised with tau_c*mult.
                 "audio_slb_tau_mult": ("FLOAT", {
                     "default": 0.0, "min": -4.0, "max": 6.0, "step": 0.5,
-                    "tooltip": "Audio SLB handling. 0 = SLB placed fully frozen (no tau_c on audio). > 0 = SLB re-noised with tau_c×mult (ceiling 0.35). < 0 = overlap regenerates freely (best musical continuity) but the last |value| SECONDS of the previous tail stay pinned frozen at the end of the overlap, keeping the vocal phrase glued across the seam instead of restarting mid-phoneme.",
+                    "tooltip": "Audio SLB handling. 0 = SLB placed fully frozen (no tau_c on audio). > 0 = SLB re-noised with tau_c×mult (ceiling 0.35) — +1.0 is the measured sweet spot with the guide on: the near-frozen overlap carries the TRUE tail while the guide steers the continuation. < 0 = overlap regenerates freely (best musical continuity) but the last |value| SECONDS of the previous tail stay pinned frozen at the end of the overlap. Do NOT fully re-render the overlap under the guide: measured on a 10-chunk chain it copies the guide's motif (looping) and creeps hot (noise spiral).",
                     }),
                 "audio_guide_seconds": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.25,
-                    "tooltip": "Audio seam guide: pins the last N seconds of the previous chunk's audio as a cond_audio guide keyframe whose window ENDS exactly at the join and reaches BACKWARD (fractional/negative anchor index — the H3-Motion-Context pack's measured mechanism: seam correlation 0.45 -> 0.95+ vs reference placement; a forward/overlap-aligned guide makes the model loop the motif instead). Pairs with audio_slb_tau_mult > 0 (re-noised, re-rendered overlap) — do not freeze the overlap under the guide. 1.0 s = 40 latent steps, the pack's validated default. 0 = off.",
+                    "tooltip": "Audio seam guide: pins the last N seconds of the previous chunk's audio as a cond_audio guide keyframe whose window ENDS exactly at the join and reaches BACKWARD (fractional/negative anchor index — the H3-Motion-Context pack's measured mechanism: seam correlation 0.45 -> 0.95+ vs reference placement; a forward/overlap-aligned guide makes the model loop the motif instead). Pair with audio_slb_tau_mult = +1.0: the near-frozen overlap carries the true tail, the guide steers the continuation, the crossfade hides the residual edge, and a per-scene RMS anchor stops the hot-tail noise spiral. 1.0 s = 40 latent steps, the pack's validated default. 0 = off. Requires ComfyUI 0.34.0+ (fractional/negative keyframe anchors).",
                     }),
                 # How the text conditioning changes at a scene boundary:
                 # "transition_chunk" — two-step crossfade straddling the boundary: the
@@ -834,6 +866,7 @@ class CLSSH3StreamingSampler:
         # source of the end-aligned guide window (see audio_guide_seconds)
         _audio_tail: torch.Tensor | None = None
         _s1_prev_last: torch.Tensor | None = None
+        _s1_aud_rms_ref: float | None = None
         _s1_vid_std_ref: float | None = None
         _prev_scene_idx: int | None = None
         _s1_band_ref: tuple[float, float] | None = None
@@ -846,6 +879,7 @@ class CLSSH3StreamingSampler:
             "vid_std": [], "vid_ident": [], "vid_intra": [], "vid_bnd": [],
             "vid_hf": [], "vid_origin": [],
             "aud_env": [], "aud_rms": [], "aud_bnd": [], "aud_slb": [],
+            "aud_dlv": [], "aud_lvl": [],
             "aud_wc": [], "aud_hf": [],
         }
 
@@ -871,6 +905,7 @@ class CLSSH3StreamingSampler:
                 _s1_band_ref = None
                 _origin_ref = None
                 _origin_layout = None
+                _s1_aud_rms_ref = None
                 # §2.3: drop the old scene's EMA reference — the first chunk of the
                 # new scene is uncorrected and re-anchors the EMA (incl. _init_std).
                 clss_state.reset_drift_refs()
@@ -917,6 +952,7 @@ class CLSSH3StreamingSampler:
                 _g = min(round(audio_guide_seconds * AUDIO_LATENT_FPS),
                          _audio_tail.shape[-1])
                 if _g > 0 and _join_af > 0:
+                    _check_guide_layout()
                     keyframes.append({
                         # start coord = join - g  =>  index = (join - g)/RESCALE;
                         # negative/fractional whenever g > overlap — intended.
@@ -969,17 +1005,41 @@ class CLSSH3StreamingSampler:
             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
             _slb_ctx_used: torch.Tensor | None = None
             _slb_ctx_pos = 0
+            # NOTE (measured, 10-chunk chain): with the guide on, do NOT
+            # fully re-render the audio overlap.  H3-Motion-Context's
+            # full-fresh head works for 2-4 clip chains of SEPARATE sampler
+            # runs; inside one chunked run the guide re-pins every chunk and
+            # a fresh overlap copies the guide's motif (looping, aud_wc ->
+            # 0.99) while creeping hot (aud_rms +37 % over 10 chunks).  The
+            # working split: near-frozen SLB (mult +1.0) carries the TRUE
+            # tail, the end-aligned guide steers the continuation, the
+            # crossfade hides the residual edge, and the RMS anchor below
+            # breaks the energy spiral.
             if has_aud_slb and audio_slb_tau_mult >= 0.0:
                 slb = audio_slb_latent.to(device)
                 n = min(_Ta_ol_w, slb.shape[-1], chunk_af)
-                _slb_ctx = slb[..., :n]
-                lat_aud[..., :n] = _slb_ctx
+                # END-align the SLB at the join: window row _Ta_ol_w is
+                # delivered as the first NEW frame, so the overlap rows
+                # [0, _Ta_ol_w) cover delivered positions [E-_Ta_ol_w, E)
+                # and the matching tail content is the SLB's LAST n frames.
+                # Start-aligning (slb[..., :n] at row 0) writes the tail one
+                # audio frame (25 ms) EARLY whenever the window rounding
+                # lands _Ta_ol_w = Ta_ol - 1 (e.g. 22 px overlap + 238 px
+                # chunks) and drops the true last frame — the model then
+                # continues from content 25 ms in the past and the crossfade
+                # smears the phase-shifted copy across the seam (measured:
+                # aud_dlv 0.13, WORSE than the raw edge aud_bnd 0.26).
+                # Video never hits this: its overlap is exact on the 5k+2
+                # token grid, only the audio 5/3 rescale rounds.
+                _slb_ctx_pos = _Ta_ol_w - n
+                _slb_ctx = slb[..., -n:]
+                lat_aud[..., _slb_ctx_pos:_Ta_ol_w] = _slb_ctx
                 if audio_slb_tau_mult > 0.0:
                     _tau_c_a = _tau_c_eff(clss_config.tau_c * audio_slb_tau_mult,
                                           _AUDIO_TAU_C_CEILING, chunk_idx - 1)
                 else:
                     _tau_c_a = 0.0
-                mask_aud[..., :n] = _tau_c_a
+                mask_aud[..., _slb_ctx_pos:_Ta_ol_w] = _tau_c_a
                 _slb_ctx_used = _slb_ctx.detach().cpu()
             elif has_aud_slb:
                 # audio_slb_tau_mult < 0: regenerate the overlap freely (best
@@ -994,10 +1054,12 @@ class CLSSH3StreamingSampler:
                 n = min(_Ta_ol_w, slb.shape[-1], chunk_af)
                 _pin_af = min(round(-audio_slb_tau_mult * AUDIO_LATENT_FPS), n)
                 if _pin_af > 0:
-                    _slb_ctx_pos = n - _pin_af
-                    _slb_ctx = slb[..., _slb_ctx_pos:n]
-                    lat_aud[..., _slb_ctx_pos:n] = _slb_ctx
-                    mask_aud[..., _slb_ctx_pos:n] = 0.0
+                    # end-aligned like the SLB above: the pinned frames must
+                    # sit in the rows immediately before the kept region.
+                    _slb_ctx_pos = _Ta_ol_w - _pin_af
+                    _slb_ctx = slb[..., -_pin_af:]
+                    lat_aud[..., _slb_ctx_pos:_Ta_ol_w] = _slb_ctx
+                    mask_aud[..., _slb_ctx_pos:_Ta_ol_w] = 0.0
                     _slb_ctx_used = _slb_ctx.detach().cpu()
             chunk_latent = {
                 "samples": comfy.nested_tensor.NestedTensor((lat_vid, lat_aud)),
@@ -1111,25 +1173,48 @@ class CLSSH3StreamingSampler:
                                                (_ea.norm() * _eb.norm() + 1e-8)))
             _prev_aud_env = _env
             if is_first:
-                # fade-in + soft clip on the very first chunk: the model's
-                # opening frames tend to overshoot the audio VAE's calibrated
-                # range; carried over from the LTX port (revalidate on H3).
+                # fade-in on the very first chunk only (a ramp at a chunk
+                # join would read as a level dip at the seam).
                 _n_fade = min(8, new_aud.shape[-1])
                 if _n_fade >= 2:
                     _ramp = torch.linspace(0.125, 1.0, _n_fade, device=device)
                     new_aud = new_aud.clone()
                     new_aud[..., :_n_fade] = new_aud[..., :_n_fade] * _ramp
-                _fa = new_aud.float()
-                _sig = _fa.std(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-                _over = (_fa.abs() - _sig * 3.5).clamp(min=0)
-                new_aud = (_fa - torch.sign(_fa)
-                           * (_over - 0.5 * _sig * torch.tanh(_over / _sig))).to(aud_out.dtype)
+            # soft clip EVERY chunk, not just the first: each chunk's opening
+            # frames (right after the pinned overlap) overshoot the audio
+            # VAE's calibrated range the same way the run's opening does —
+            # delivered unclipped they land as transient "noise" starting
+            # exactly at every chunk join (seed-independent, rms-neutral,
+            # spectrogram-visible).  Gentle tanh knee above 3.5 sigma of the
+            # chunk's own level; transparent for in-range content.
+            _fa = new_aud.float()
+            _sig = _fa.std(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+            _over = (_fa.abs() - _sig * 3.5).clamp(min=0)
+            new_aud = (_fa - torch.sign(_fa)
+                       * (_over - 0.5 * _sig * torch.tanh(_over / _sig))).to(aud_out.dtype)
             _aud_sims = _aud_within_chunk_sims(new_aud)
             if _aud_sims:
                 _trend["aud_wc"].append(_aud_sims[-1])
             if _s1_aud_prev_last is not None:
                 _trend["aud_bnd"].append(_aud_cos(_s1_aud_prev_last.to(device), new_aud[..., :1]))
-            _trend["aud_rms"].append(new_aud.float().pow(2).mean().sqrt().item())
+            # §2.3 audio counterpart: per-scene RMS anchor (deadband, then a
+            # half-strength pull toward the scene's first chunk — same shape
+            # as the video std anchor above).  Without it the re-rendered
+            # chunks creep hot (+2-4 %/chunk measured: 0.45 -> 0.61 over a
+            # 10-chunk run) and the end-aligned guide pins the hot tail as
+            # the next chunk's clean reference — a compounding noise spiral.
+            # Applied BEFORE the SLB/tail bookkeeping so the guide and the
+            # next overlap carry the corrected audio.
+            _cur_arms = new_aud.float().pow(2).mean().sqrt().item()
+            if _s1_aud_rms_ref is None:
+                _s1_aud_rms_ref = _cur_arms
+            else:
+                _ratio_a = _s1_aud_rms_ref / max(_cur_arms, 1e-6)
+                if _ratio_a < 0.94 or _ratio_a > 1.06:
+                    _g_a = 1.0 + 0.5 * (_ratio_a - 1.0)
+                    new_aud = (new_aud.float() * _g_a).to(new_aud.dtype)
+                    _cur_arms *= _g_a
+            _trend["aud_rms"].append(_cur_arms)
             with torch.no_grad():
                 _freq_e = new_aud.float().abs().mean(dim=(0, 2, 3)).tolist()
             if _s1_audio_freq_ref is None:
@@ -1175,14 +1260,38 @@ class CLSSH3StreamingSampler:
                 _w_xf = torch.linspace(0.0, 1.0, _n_xf,
                                        dtype=acc_audio[-1].dtype).view(1, 1, 1, -1)
                 _prev_kept = acc_audio[-1]
+                # the blend source is the LAST _n_xf frames of the dropped
+                # span — the rows abutting the kept region, aligned with the
+                # tail's last _n_xf frames (both cover delivered
+                # [E-_n_xf, E)).  Differs from aud_out[..., :_n_xf] whenever
+                # _n_xf < aud_drop (frozen cap or short acc).
+                _xf_src = aud_out[..., aud_drop - _n_xf:aud_drop]
                 # no in-place write: on CPU-only runs new_aud.cpu() aliases and
                 # an in-place blend would retroactively rewrite audio_slb_latent
                 # and _audio_tail (the guide's source) with delivered values.
                 acc_audio[-1] = torch.cat([
                     _prev_kept[..., :-_n_xf],
                     _prev_kept[..., -_n_xf:] * (1.0 - _w_xf)
-                    + aud_out[..., :_n_xf].cpu().to(_prev_kept.dtype) * _w_xf,
+                    + _xf_src.cpu().to(_prev_kept.dtype) * _w_xf,
                 ], dim=-1)
+            if not is_first and acc_audio and new_aud.shape[-1] > 0:
+                # DELIVERED seam (post-crossfade) — what the listener actually
+                # gets.  aud_bnd above measures the raw pre-blend edge of the
+                # model's continuation; aud_dlv measures the seam after the
+                # soft-seam blend, aud_lvl the 1 s RMS level step across it
+                # in dB (0 = no step; the audible "the room tone jumped"
+                # failure).  Concept stolen from H3-Motion-Context's Seam
+                # Probe (correlation / RMS step / floor step across a join).
+                _trend["aud_dlv"].append(_aud_cos(
+                    acc_audio[-1][..., -1:].to(device), new_aud[..., :1]))
+                _Lw = min(round(AUDIO_LATENT_FPS), acc_audio[-1].shape[-1],
+                          new_aud.shape[-1])
+                if _Lw > 0:
+                    _lv_prev = acc_audio[-1][..., -_Lw:].float().pow(2).mean().sqrt()
+                    _lv_new = new_aud[..., :_Lw].float().pow(2).mean().sqrt()
+                    _trend["aud_lvl"].append(
+                        20.0 * math.log10(float(_lv_new)
+                                          / max(float(_lv_prev), 1e-8)))
             acc_audio.append(new_aud.cpu())
             audio_chunk_ends.append(sum(a.shape[-1] for a in acc_audio))
             _s1_aud_prev_last = new_aud[..., -1:].cpu()
