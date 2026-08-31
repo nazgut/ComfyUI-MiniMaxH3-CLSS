@@ -8,13 +8,14 @@ Video diffusion transformers generate only a few seconds per pass (H3's trained 
 
 CLSS treats the chunk hand-off as a **feedback loop** and controls it. Chunks share a streaming latent buffer (**SLB**) overlap and between chunks CLSS applies lightweight corrections — **without modifying any transformer weights**:
 
-- **Calibrated context re-noising** (τc) — the overlap is written into the chunk's initial latent and re-noised via H3's per-token denoise masks (mask m → per-row sigma m·σ), so the model actively re-projects it onto the data manifold instead of accepting it verbatim
+- **Calibrated context re-noising** (τc) — the video overlap is written into the chunk's initial latent and re-noised via H3's per-token denoise masks (mask m → per-row sigma m·σ), so the model actively re-projects it onto the data manifold instead of accepting it verbatim
 - **EMA-tracked per-channel AdaIN** (β) — suppresses fast statistical drift; the EMA reference **resets at every scene change**
 - **Dynamic anchor bank** — long-range identity tracking; top-m anchors are pinned as H3 `minimax_keyframes` conditioning rows (re-injected every step, never denoised)
 - **Two-band spatial detail anchor** — counters progressive high-frequency decay on long runs
-- **Audio seam control** — the audio SLB can be placed frozen, re-noised, or regenerated freely with the last N seconds of the previous tail pinned at the seam so vocal phrases aren't cut mid-phoneme
+- **Audio seam guide** — the last N seconds of the previous chunk's audio are pinned as a `cond_audio` guide keyframe whose window **ends exactly at the join and reaches backward** (fractional/negative anchor index). This end-aligned placement is the measured mechanism that takes seam correlation from 0.45 to 0.95+; a forward/overlap-aligned guide makes the model loop the motif instead. The guide is the *only* audio context — overlap rows are fresh noise and the join is a plain cut
+- **Split video/audio CFG with continuation-chunk falloff** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale. On continuation chunks `audio_cfg_cont` drops audio CFG (default 1.0 = off): the SLB overlap cancels out of the CFG direction, so high audio CFG at a join just amplifies the re-applied text prompt and opens a new musical section every chunk
 - **Optional temporally-correlated noise** (FreeNoise/PYoCo family, exact N(0,1) marginals preserved)
-- **Split video/audio CFG** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale
+- **Optional i2v first-frame guide** — an image input is VAE-encoded and pinned as a `minimax_keyframes` row at frame 0 of chunk 0 (H3-native first-frame conditioning)
 
 ## Multi-scene prompts
 
@@ -45,7 +46,7 @@ Text encoder — two options:
 - **Small (recommended for 16 GB cards):** the [ComfyUI-ClipProj](https://github.com/NicoLab28) pack's `ClipProjLoader` with a Qwen3-VL-4B (`qwen3vl_4b_fp8_scaled.safetensors`, `models/text_encoders/`) + learned projection (`mmh3-4b-ClipProj-v3.1.safetensors`, `models/clip_projections/`). ~5.5 GB instead of 15.7 GB; the canonical workflow uses this.
 - **Stock:** `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` via `CLIPLoader` (type `minimax`) — swap node 4 in the workflow if you prefer the full 32B encoder.
 
-Requires ComfyUI ≥ 0.30 with native MiniMax H3 support (nodes `EmptyMiniMaxH3LatentAV` etc.).
+Requires **ComfyUI ≥ 0.34** (the audio seam guide relies on fractional/negative keyframe anchor indices; the sampler fails loudly with instructions on older versions when the guide is enabled).
 
 ## Installation
 
@@ -54,7 +55,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/nazgut/ComfyUI-MiniMaxH3-CLSS.git
 ```
 
-Restart ComfyUI — no pip install step, no submodules. Load [`workflow/t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json) (canonical t2v config: 1344×768, 11.5 s chunk windows, 6 chunks ≈ 65 s).
+Restart ComfyUI — no pip install step, no submodules. Load [`workflow/t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json). The canonical workflow is a quick 2-chunk smoke config (832×480, 243 px ≈ 10 s windows, 12 steps, sigma shift 12/6 — the live-validated 16 GB reference stack); raise `num_chunks` (and add scene blocks) for long runs.
 
 ## Nodes
 
@@ -64,7 +65,7 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 |---|---|
 | **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid, noise temporal correlation) |
 | **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING |
-| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, scene crossfade, corrections, per-chunk telemetry + end-of-run trend summary |
+| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
@@ -84,7 +85,11 @@ workflow/    # canonical t2v workflow — copy it for experiments, don't mutate 
 
 ## Status
 
-Early port: the generation path is validated by import/logic checks only until live runs confirm it. Defaults follow the LTX-validated CLSS config where the mechanism maps 1:1; H3-specific choices (12 s window cap, overlap 7 tokens, keyframe-row anchors) are conservative starting points, not yet ear/eye-validated.
+Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL-4B text encoder, 832×480, 243 px windows, 12 steps, sigma shift 12/6). Audio seam continuity is measured, not guessed: the end-aligned guide takes cross-join correlation from 0.45 to 0.95+, and per-chunk telemetry (`aud_bnd` / `aud_dlv` / `aud_lvl` / …) localizes any remaining seam or drift issues. Defaults are the measured production config — read the tooltips before changing them.
+
+## Support
+
+If this node pack is useful to you, you can support its development on Patreon: **[patreon.com/c/AleksanderM](https://www.patreon.com/c/AleksanderM)**
 
 ## Acknowledgements
 

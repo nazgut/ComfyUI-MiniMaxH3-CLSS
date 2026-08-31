@@ -203,7 +203,6 @@
       "fps": 24,
       "detail_anchor": "on",
       "video_slb_tau_mult": 1,
-      "audio_slb_tau_mult": 1,
       "audio_guide_seconds": 1,
       "scene_handoff": "hard",
       "guider": [
