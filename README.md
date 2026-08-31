@@ -14,7 +14,6 @@ CLSS treats the chunk hand-off as a **feedback loop** and controls it. Chunks sh
 - **Two-band spatial detail anchor** — counters progressive high-frequency decay on long runs
 - **Audio seam guide** — the last N seconds of the previous chunk's audio are pinned as a `cond_audio` guide keyframe whose window **ends exactly at the join and reaches backward** (fractional/negative anchor index). This end-aligned placement is the measured mechanism that takes seam correlation from 0.45 to 0.95+; a forward/overlap-aligned guide makes the model loop the motif instead. The guide is the *only* audio context — overlap rows are fresh noise and the join is a plain cut
 - **Split video/audio CFG with continuation-chunk falloff** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale. On continuation chunks `audio_cfg_cont` drops audio CFG (default 1.0 = off): the SLB overlap cancels out of the CFG direction, so high audio CFG at a join just amplifies the re-applied text prompt and opens a new musical section every chunk
-- **Optional temporally-correlated noise** (FreeNoise/PYoCo family, exact N(0,1) marginals preserved)
 - **Optional i2v first-frame guide** — an image input is VAE-encoded and pinned as a `minimax_keyframes` row at frame 0 of chunk 0 (H3-native first-frame conditioning)
 
 ## Multi-scene prompts
@@ -55,7 +54,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/nazgut/ComfyUI-MiniMaxH3-CLSS.git
 ```
 
-Restart ComfyUI — no pip install step, no submodules. Load [`workflow/t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json). The canonical workflow is a quick 2-chunk smoke config (832×480, 243 px ≈ 10 s windows, 12 steps, sigma shift 12/6 — the live-validated 16 GB reference stack); raise `num_chunks` (and add scene blocks) for long runs.
+Restart ComfyUI — no pip install step, no submodules. Load [`workflow/t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json). The canonical workflow is the live-validated 16 GB reference config: 832×480, 243 px ≈ 10 s chunk windows, 10 chunks ≈ 100 s total, 20 steps, sigma shift 12/6.
 
 ## Nodes
 
@@ -85,7 +84,7 @@ workflow/    # canonical t2v workflow — copy it for experiments, don't mutate 
 
 ## Status
 
-Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL-4B text encoder, 832×480, 243 px windows, 12 steps, sigma shift 12/6). Audio seam continuity is measured, not guessed: the end-aligned guide takes cross-join correlation from 0.45 to 0.95+, and per-chunk telemetry (`aud_bnd` / `aud_dlv` / `aud_lvl` / …) localizes any remaining seam or drift issues. Defaults are the measured production config — read the tooltips before changing them.
+Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL-4B text encoder, 832×480, 243 px windows, 20 steps, sigma shift 12/6). Audio seam continuity is measured, not guessed: the end-aligned guide takes cross-join correlation from 0.45 to 0.95+, and per-chunk telemetry (`aud_bnd` / `aud_dlv` / `aud_lvl` / …) localizes any remaining seam or drift issues. Defaults are the measured production config — read the tooltips before changing them.
 
 ## Support
 
