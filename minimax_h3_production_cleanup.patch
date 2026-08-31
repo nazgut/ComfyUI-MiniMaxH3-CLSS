@@ -1,0 +1,937 @@
+diff --git a/clss.py b/clss.py
+index f848c1e..6cca162 100644
+--- a/clss.py
++++ b/clss.py
+@@ -1,7 +1,7 @@
+ """
+ Closed-Loop Streaming Synthesis (CLSS) algorithm components.
+ 
+-CLSS extends Latent Streaming Synthesis (LSS) with three closed-loop corrections that
++CLSS extends Latent Streaming Synthesis (LSS) with closed-loop corrections that
+ eliminate the exposure-bias drift accumulation inherent in open-loop streaming:
+ 
+   §2.1  Calibrated context re-noising
+@@ -19,23 +19,13 @@ eliminate the exposure-bias drift accumulation inherent in open-loop streaming:
+         evolution (lighting changes, scene content) passes through.  Applied as a
+         per-channel AdaIN-style renormalisation blended with factor β.
+ 
+-  §2.5  Dynamic anchor bank
+-        A small bank of anchor keyframes is maintained.  The first frame of the
+-        first chunk seeds the bank.  Persistent cosine-similarity drops (below
+-        threshold ρ for two consecutive chunks) trigger a new anchor.  Chunk N
+-        cross-attends to the top-m most similar anchors, providing soft long-range
+-        identity without dragging back to a single frozen frame-0 reference.
+-        Anchor similarity is computed from mean-pooled, L2-normalised latent
+-        features (no separate image encoder is assumed to be at hand).
+-
+ Algorithm 1 (per-chunk step):
+   1.  L_overlap  ← SLB.read()
+   2.  L̃_overlap ← α(τc)·L_overlap + σ(τc)·ε          [§2.1, via conditioning]
+-  3.  A_m        ← top-m anchors by feature similarity  [§2.5]
+-  4.  L_N        ← Generate(L̃_overlap, A_m, prompt)
+-  5.  L_N        ← AdaIN lerp toward per-channel EMA ref, factor β  [§2.3]
+-  6.  EMA refs   ← update(L_N); anchor bank ← update on persistent scene change
+-  7.  SLB.push(trailing frames)
++  3.  L_N        ← Generate(L̃_overlap, prompt)
++  4.  L_N        ← AdaIN lerp toward per-channel EMA ref, factor β  [§2.3]
++  5.  EMA refs   ← update(L_N)
++  6.  SLB.push(trailing frames)
+ """
+ 
+ from __future__ import annotations
+@@ -45,7 +35,6 @@ from dataclasses import dataclass
+ from typing import Optional
+ 
+ import torch
+-import torch.nn.functional as F
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -79,20 +68,6 @@ class CLSSConfig:
+     ema_lambda:
+         EMA update rate per chunk (§2.3).  Slow enough to track intended
+         scene evolution while suppressing per-chunk drift.  Recommended: 0.05–0.10.
+-    anchor_threshold:
+-        Cosine-similarity threshold below which a chunk is considered a candidate
+-        scene change (§2.5).  Default 0.78 (from the paper).
+-    anchor_persistence:
+-        Number of consecutive below-threshold chunks required before a new anchor
+-        is committed (persistence test, §2.5).  Filters transient occlusions.
+-    anchor_max_size:
+-        Maximum number of anchors retained in the bank (§2.5).  Oldest
+-        least-recently-retrieved anchor is evicted when the cap is exceeded.
+-    anchor_top_m:
+-        Number of anchors retrieved per chunk for conditioning (§2.5).
+-    anchor_strength:
+-        Denoising strength for anchor keyframe tokens (1.0 = fully clean / no
+-        denoising; use 1.0 to prevent anchor frames from being corrupted).
+     overlap_latent_frames:
+         Number of latent frames shared between consecutive chunks (the SLB size).
+         Corresponds to the temporal context the model sees from the previous chunk.
+@@ -126,18 +101,6 @@ class CLSSConfig:
+     # Recommended: 1.2 when noise/grain is visible, especially with < 30 steps.
+     adain_max_amplification: float = 0.0
+ 
+-    # §2.5  Dynamic anchor bank
+-    anchor_threshold: float = 0.78
+-    anchor_persistence: int = 2
+-    anchor_max_size: int = 8
+-    anchor_top_m: int = 2
+-    anchor_strength: float = 1.0
+-    # Force a new anchor every N chunks regardless of similarity.  0 = disabled.
+-    # Without this, on visually-stable scenes the bank stagnates (similarity stays
+-    # above threshold, persistence never fires) and the model loses recent reference
+-    # frames — the primary cause of content collapse after ~10-15 chunks.
+-    anchor_force_every: int = 5
+-
+     # Streaming buffer dimensions
+     # 8 latent frames ≈ 57 pixel frames ≈ 2.4 s of hard context from previous chunk.
+     # Combined with tau_c=0.05 this makes the overlap frames nearly frozen, giving
+@@ -145,39 +108,11 @@ class CLSSConfig:
+     overlap_latent_frames: int = 8
+     new_latent_frames: int = 13
+ 
+-    # §3.7  Open-loop model gain measurement.
+-    # measure_g: run a second denoising pass with a perturbed overlap on every chunk
+-    #   that has overlap, to track g = ||Δ_output||_F / ||δ_input||_F per-chunk.
+-    #   Doubles denoising time for non-first chunks.  Requires a non-None generator.
+-    # measure_g_epsilon: perturbation magnitude as a fraction of the overlap norm.
+-    measure_g: bool = True
+-    measure_g_epsilon: float = 0.01
+-
+-    # Temporally-correlated initial video noise (EXPERIMENTAL, off by default —
+-    # unvalidated until a live run).  Targets the measured ~4 s layout
+-    # oscillation, which is invariant to chunk length / overlap length / SLB
+-    # strength: with i.i.d. noise every ~4 s span of frames carries an
+-    # independent low-frequency "content suggestion" that the model resolves as
+-    # a fresh motion arc at its trained temporal horizon.  Mixing a run-constant
+-    # shared frame into every video noise frame,
+-    #     n_t = sqrt(1-a)·eps_t + sqrt(a)·eps_shared,
+-    # keeps each frame's marginal exactly N(0,1) but raises frame-to-frame noise
+-    # correlation to a at ALL lags (inference-time correlated noise prior, same
+-    # family as FreeNoise noise rescheduling / PYoCo mixed noise).  Unlike
+-    # block-repeat schemes this cannot introduce a new periodicity.  0.0 = off
+-    # (bit-exact baseline).  Worst case behaves like a seed change with more
+-    # static content.
+-    noise_temporal_corr: float = 0.0
+-
+     def __post_init__(self) -> None:
+         if not 0.0 <= self.tau_c <= 1.0:
+             raise ValueError(f"tau_c must be in [0, 1], got {self.tau_c}")
+         if not 0.0 <= self.beta <= 1.0:
+             raise ValueError(f"beta must be in [0, 1], got {self.beta}")
+-        if not 0.0 <= self.noise_temporal_corr < 1.0:
+-            raise ValueError(
+-                f"noise_temporal_corr must be in [0, 1), got {self.noise_temporal_corr}"
+-            )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -250,180 +185,39 @@ class _PerChannelEMA:
+         return blended.view(C, B, F, H, W).permute(1, 0, 2, 3, 4).to(latent.dtype)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# §2.5  Dynamic anchor bank
+-# ---------------------------------------------------------------------------
+-
+-
+-@dataclass
+-class _AnchorEntry:
+-    """Single keyframe anchor."""
+-    feature: torch.Tensor    # [C] L2-normalised mean-pooled latent feature
+-    latent: torch.Tensor     # [1, C, 1, H, W] single-frame latent
+-    frame_idx: int           # absolute latent frame index in the full generated video
+-    last_retrieved: int = 0  # chunk index of most recent retrieval (for LRU eviction)
+-
+-
+-class _AnchorBank:
+-    """Dynamic keyframe anchor bank with LRU eviction (§2.5)."""
+-
+-    def __init__(self, threshold: float, persistence: int, max_size: int) -> None:
+-        self.threshold = threshold
+-        self.persistence = persistence
+-        self.max_size = max_size
+-        self.anchors: list[_AnchorEntry] = []
+-        self._below_count = 0
+-
+-    @staticmethod
+-    def _feature(frame_latent: torch.Tensor) -> torch.Tensor:
+-        """Compute a [C] feature from a [1, C, 1, H, W] single-frame latent."""
+-        v = frame_latent.float().mean(dim=(0, 2, 3, 4))  # [C]
+-        return F.normalize(v.unsqueeze(0), dim=1).squeeze(0)
+-
+-    def _max_cosine_sim(self, feat: torch.Tensor) -> float:
+-        if not self.anchors:
+-            return 0.0
+-        return max(
+-            F.cosine_similarity(feat.unsqueeze(0), a.feature.unsqueeze(0)).item()
+-            for a in self.anchors
+-        )
+-
+-    def initialize(self, frame_latent: torch.Tensor, frame_idx: int) -> None:
+-        """Seed the bank with the first anchor (called once for chunk 0)."""
+-        feat = self._feature(frame_latent)
+-        self.anchors = [_AnchorEntry(feature=feat, latent=frame_latent.clone(), frame_idx=frame_idx)]
+-
+-    def update(
+-        self,
+-        frame_latent: torch.Tensor,
+-        frame_idx: int,
+-        chunk_idx: int,
+-        force: bool = False,
+-    ) -> bool:
+-        """Evaluate scene-change condition; commit a new anchor if triggered.
+-
+-        force=True bypasses the threshold/persistence check and always adds an
+-        anchor.  Used for periodic forced insertions so the bank always contains
+-        recent frames (prevents content drift on long, visually-stable videos).
+-        Returns True if a new anchor was committed this call.
+-        """
+-        feat = self._feature(frame_latent)
+-        sim = self._max_cosine_sim(feat)
+-        if sim < self.threshold:
+-            self._below_count += 1
+-        else:
+-            self._below_count = 0
+-
+-        committed = False
+-        if force or self._below_count >= self.persistence:
+-            # a commit — forced or triggered — resets the persistence streak
+-            self._below_count = 0
+-            self.anchors.append(
+-                _AnchorEntry(
+-                    feature=feat,
+-                    latent=frame_latent.clone(),
+-                    frame_idx=frame_idx,
+-                    last_retrieved=chunk_idx,
+-                )
+-            )
+-            committed = True
+-            # LRU eviction: remove the anchor retrieved least recently
+-            while len(self.anchors) > self.max_size:
+-                self.anchors.sort(key=lambda a: a.last_retrieved)
+-                self.anchors.pop(0)
+-        return committed
+-
+-    # Anchors whose similarity to the current overlap exceeds this are redundant:
+-    # the overlap conditioning already captures them.  Injecting redundant anchors
+-    # alongside the overlap can confuse the model (two near-identical conditions
+-    # at the same temporal position).
+-    _REDUNDANCY_SIM_THRESHOLD: float = 0.85
+-
+-    def retrieve(
+-        self, context_latent: torch.Tensor, top_m: int, chunk_idx: int
+-    ) -> list[_AnchorEntry]:
+-        """Return top-m non-redundant anchors by cosine similarity to *context_latent*.
+-
+-        context_latent: [1, C, F, H, W] — uses the last frame as the query.
+-        Anchors with similarity > _REDUNDANCY_SIM_THRESHOLD are skipped: they are
+-        nearly identical to the current overlap and the overlap conditioning
+-        already handles them.  This prevents injecting a "chunk N-1 last frame"
+-        anchor that duplicates the overlap and conflicts with it at the start of
+-        the new chunk.
+-        Updates last_retrieved for returned anchors (prevents premature eviction).
+-        """
+-        if not self.anchors or top_m == 0:
+-            return []
+-        query_feat = self._feature(context_latent[:, :, -1:])
+-        sims = [
+-            F.cosine_similarity(query_feat.unsqueeze(0), a.feature.unsqueeze(0)).item()
+-            for a in self.anchors
+-        ]
+-        # Keep only anchors that add information the overlap doesn't already provide
+-        candidates = [
+-            i for i, s in enumerate(sims) if s < self._REDUNDANCY_SIM_THRESHOLD
+-        ]
+-        if not candidates:
+-            return []
+-        top_indices = sorted(candidates, key=lambda i: sims[i], reverse=True)[:top_m]
+-        result = []
+-        for idx in top_indices:
+-            self.anchors[idx].last_retrieved = chunk_idx
+-            result.append(self.anchors[idx])
+-        return result
+-
+-
+-# ---------------------------------------------------------------------------
+-# CLSSState — orchestrates all per-chunk state
+-# ---------------------------------------------------------------------------
+-
+-
+ class CLSSState:
+     """Persistent CLSS state maintained across all chunk steps.
+ 
+-    Manages the three CLSS components:
++    Manages the two CLSS components:
+     - Streaming Latent Buffer (SLB): the overlap latent passed to the next chunk
+     - Per-channel EMA reference for AdaIN correction (§2.3)
+-    - Dynamic anchor bank for long-range identity (§2.5)
+ 
+     Usage::
+ 
+         clss = CLSSState(config)
+         for chunk_latent_frames in chunk_schedule:
+-            # 1. Build conditionings: overlap (§2.1) + anchors (§2.5)
+-            conds = clss.get_overlap_conditioning() + clss.get_anchor_conditioning()
++            # 1. Read the SLB overlap and feed it as context (host sampler's job)
++            overlap = clss.overlap_latent
+ 
+-            # 2. Run DiffusionStage with *conds*; get chunk output [1,C,F,H,W]
+-            generated = ...
+-
+-            # 3. Extract new frames (drop the overlap region)
++            # 2. Generate the chunk; extract the new frames (drop the overlap)
+             new_frames = generated[:, :, overlap_lf:] if chunk_idx > 0 else generated
+ 
+-            # 4. Apply CLSS corrections (§2.3), update EMA + anchor bank
++            # 3. Apply CLSS corrections (§2.3), update the EMA reference
+             corrected = clss.post_process(new_frames)
+ 
+-            # 5. Update the SLB for the next iteration
++            # 4. Update the SLB for the next iteration
+             clss.update_buffer(corrected)
+ 
+-            # 6. Accumulate corrected for final decoding
++            # 5. Accumulate corrected for final decoding
+             all_latents.append(corrected)
+     """
+ 
+     def __init__(self, config: CLSSConfig) -> None:
+         self.config = config
+         self._ema = _PerChannelEMA()
+-        self._anchor_bank = _AnchorBank(
+-            threshold=config.anchor_threshold,
+-            persistence=config.anchor_persistence,
+-            max_size=config.anchor_max_size,
+-        )
+         # Streaming Latent Buffer: last overlap_latent_frames from the previous chunk
+         self._overlap_latent: Optional[torch.Tensor] = None   # [1, C, overlap_F, H, W]
+         self._chunk_index: int = 0
+-        self._abs_frame_idx: int = 0  # next absolute latent frame index to be written
+-        # §3.7 Open-loop model gain: set by the pipeline after a perturbation experiment
+-        self.g_measured: Optional[float] = None
+-        self.rho_closed: Optional[float] = None
+ 
+     def reset_drift_refs(self) -> None:
+         """Drop the §2.3 EMA reference (call on a scene change).
+@@ -445,18 +239,6 @@ class CLSSState:
+         """
+         return self._overlap_latent
+ 
+-    def top_anchors(self) -> list:
+-        """Return the top-m anchor entries most similar to the current SLB overlap.
+-
+-        Same contract note as ``overlap_latent``: turning anchors into model
+-        conditioning is the host sampler's job.
+-        """
+-        if self._overlap_latent is None:
+-            return []
+-        return self._anchor_bank.retrieve(
+-            self._overlap_latent, self.config.anchor_top_m, self._chunk_index
+-        )
+-
+     # ------------------------------------------------------------------
+     # Steps 5–6 — Post-process generated new frames
+     # ------------------------------------------------------------------
+@@ -522,96 +304,21 @@ class CLSSState:
+         return out
+ 
+     # ------------------------------------------------------------------
+-    # Step 8  — Update SLB and anchor bank
++    # Update SLB
+     # ------------------------------------------------------------------
+ 
+     def update_buffer(self, output_latent: torch.Tensor) -> None:
+-        """Push the trailing overlap frames to the SLB; update the anchor bank.
++        """Push the trailing overlap frames to the SLB.
+ 
+         output_latent: [1, C, F, H, W] — corrected new frames from this chunk.
+         The last min(overlap_latent_frames, F) frames become the SLB for the
+-        next chunk.  The anchor bank is updated with the final frame of this
+-        chunk (scene-change detection, §2.5).
++        next chunk.
+         """
+         cfg = self.config
+         F_total = output_latent.shape[2]
+ 
+-        # §2.5 Anchor bank: evaluate scene change with the last frame
+-        last_frame = output_latent[:, :, -1:]  # [1, C, 1, H, W]
+-        abs_last_frame_idx = self._abs_frame_idx + F_total - 1
+-        # Measure BEFORE mutating the bank.  Previously the sim was computed
+-        # AFTER update(), so every chunk that committed an anchor (all forced
+-        # insertions) compared the frame against ITSELF and printed a
+-        # meaningless last_frame_max_sim=1.0000 exactly where the metric
+-        # mattered.  _max_sim/_streak_pre describe the bank as it was when
+-        # this frame arrived.
+-        _feat_last  = _AnchorBank._feature(last_frame)
+-        _max_sim    = self._anchor_bank._max_cosine_sim(_feat_last)
+-        _streak_pre = self._anchor_bank._below_count
+-        if self._chunk_index == 0:
+-            self._anchor_bank.initialize(last_frame, abs_last_frame_idx)
+-            _new_anchor = True
+-            _forced = False
+-        else:
+-            _forced = (
+-                cfg.anchor_force_every > 0
+-                and self._chunk_index % cfg.anchor_force_every == 0
+-            )
+-            _new_anchor = self._anchor_bank.update(
+-                last_frame, abs_last_frame_idx, self._chunk_index, force=_forced,
+-            )
+-
+-        # §2.5 always-on telemetry: anchor bank events
+-        _bank_fids  = [a.frame_idx for a in self._anchor_bank.anchors]
+-        print(
+-            f"[CLSS] chunk={self._chunk_index}"
+-            f"  anchors: bank_size={len(self._anchor_bank.anchors)}"
+-            f"  last_frame_max_sim={_max_sim:.4f}"
+-            f"  new_anchor={_new_anchor}"
+-            f"  forced={_forced}"
+-            f"  scene_change_streak={_streak_pre}"
+-            f"  bank_frame_ids={_bank_fids}"
+-        )
+-
+-        if logger.isEnabledFor(logging.DEBUG):
+-            logger.debug(
+-                "[CLSS] chunk=%d  anchor_bank  n_anchors=%d  "
+-                "last_frame_max_sim=%.4f  below_streak=%d  threshold=%.2f",
+-                self._chunk_index,
+-                len(self._anchor_bank.anchors),
+-                _max_sim,
+-                _streak_pre,
+-                cfg.anchor_threshold,
+-            )
+-
+         # SLB: last overlap_latent_frames frames (or all if chunk is smaller)
+         n_overlap = min(cfg.overlap_latent_frames, F_total)
+         self._overlap_latent = output_latent[:, :, -n_overlap:].clone()
+ 
+-        self._abs_frame_idx += F_total
+         self._chunk_index += 1
+-
+-    # ------------------------------------------------------------------
+-    # Stability diagnostics (§2.6)
+-    # ------------------------------------------------------------------
+-
+-    @property
+-    def chunk_index(self) -> int:
+-        """Number of chunks processed so far."""
+-        return self._chunk_index
+-
+-    def loop_gain_estimate(self, beta: Optional[float] = None, tau_c: Optional[float] = None) -> float:
+-        """Estimate the closed-loop gain ρ_loop = (1 − β)·α(τc) (§2.6, Eq. 6).
+-
+-        For bounded drift we need ρ_loop < 1.  The formula omits the open-loop
+-        model gain g (which must be measured empirically, §2.6), so the returned
+-        value is a lower bound on ρ_loop.
+-
+-        Returns
+-        -------
+-        float
+-            (1 − β) · (1 − τc).  Values well below 1 give large stability margins.
+-        """
+-        b = beta if beta is not None else self.config.beta
+-        t = tau_c if tau_c is not None else self.config.tau_c
+-        return (1.0 - b) * (1.0 - t)
+diff --git a/nodes.py b/nodes.py
+index 5d45c23..b97f229 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -2,31 +2,33 @@
+ 
+ Port of the LTX-2 CLSS node layer (ComfyUI-LTX2.3-CLSS) to the MiniMax H3
+ packed audio-video DiT.  The model-agnostic algorithm core (CLSSConfig /
+-CLSSState: SLB bookkeeping, §2.3 EMA-AdaIN drift correction, §2.5 anchor bank)
+-lives in the vendored `clss.py`; this file is the H3-specific orchestration.
++CLSSState: SLB bookkeeping, §2.3 EMA-AdaIN drift correction) lives in the
++vendored `clss.py`; this file is the H3-specific orchestration.
+ 
+-Key mechanism differences from the LTX version (see also the plan / AGENTS.md):
++Key mechanism differences from the LTX version:
+ 
+ - Latent: one dict {"samples": NestedTensor((video [B,24,T,H/16,W/16],
+   audio [B,32,2,Ta]))}.  Video grid: px frames snap to 17k+5 ⇔ latent tokens
+   5k+2 (`video_latent_t`); token k covers FRAME_PER_TOKEN[k%5] = (1,4,4,4,4)
+   px frames.  Audio: Ta = round(px × 5/3) at 24 fps (40 latent fps) — the same
+   math as `temporal_shape` in comfy_extras/nodes_minimax_h3.py.
+-- §2.1 SLB overlap: the previous chunk's corrected tail is written INTO the
+-  chunk's initial latent (video tokens [0:F_ol], audio frames [0:Ta_ol]) and a
++- §2.1 SLB overlap (video only): the previous chunk's corrected tail is
++  written INTO the chunk's initial latent (video tokens [0:F_ol]) and a
+   per-stream denoise mask rides in the latent dict ("noise_mask",
+   NestedTensor).  H3 turns mask value m into a per-row sigma = m·σ
+   (model.py:587-609) and re-blends preserved rows toward the cond-strength
+   injection every step (model_base.py:2248-2272 scale_latent_inpaint, called
+   from KSamplerX0Inpaint in comfy/samplers.py:634-643).
+-- §2.5 anchors and the i2v guide image ride as `minimax_keyframes`
+-  conditioning rows ({"resolved_frame_index", "latent"}) — the H3-native
+-  pinning mechanism (model.py:340-361, pinned near-clean, re-injected every
+-  step).  Anchors anchor at resolved_frame_index=0 of the chunk window.  NOTE:
+-  the LTX node layer only tracked the anchor bank for telemetry; H3's
+-  keyframe rows make §2.5 conditioning expressible, so it is wired up here.
+-  The overlap is deliberately NOT also pinned as keyframe rows (double-pinning
+-  conflict — the overlap's job is the mask's).
++- Audio seam (H3-Motion-Context's recipe): the audio overlap rows carry NO
++  previous-tail content — they are 100% fresh noise under an all-ones mask
++  (measured on H3: masked-in audio rows are treated as output, not context).
++  The only audio context is the previous tail pinned as a cond_audio guide
++  keyframe whose window ENDS at the join (fractional/negative
++  resolved_frame_index), and the rendered overlap is trimmed with a plain
++  cut (no crossfade).
++- The i2v guide image rides as a `minimax_keyframes` conditioning row
++  ({"resolved_frame_index", "latent"}) — the H3-native pinning mechanism
++  (model.py:340-361, pinned near-clean, re-injected every step).
+ - No hard RoPE wall on H3 (no max_pos); the trained range is ~124-362 px
+   frames (~5-15 s, per the EmptyMiniMaxH3LatentAV tooltip).  The LTX
+   RoPE-wall auto-split is kept in shape with _WINDOW_CAP_S = 12.0.
+@@ -74,16 +76,6 @@ except ImportError:  # direct `import nodes` (smoke tests, scripts)
+ # §2.1 per-chunk tau_c schedule rises from the configured base toward this
+ # ceiling with a 5-chunk half-life (late chunks drift more, get more repair).
+ _VIDEO_TAU_C_CEILING = 0.10
+-# Audio re-noise ceiling.  tau is the MODEL's share of the blend
+-# (out = tau*model + (1-tau)*tail EVERY denoising step), so the old 0.35
+-# capped every positive mult at >=65% tail-clamped — and because _tau_c_eff
+-# inverts when base > ceiling, any mult above ~7 DECAYED chunk-over-chunk
+-# toward 0.35.  The true light-re-noise range (tau ~0.5-0.7: the tail rides
+-# the target rows at 30-50% weight as groove context, loose enough to avoid
+-# copy-loops) was unreachable by config.  0.95 restores the schedule's
+-# design intent (start at base, loosen toward the ceiling over the run)
+-# across the whole usable mult range (mult 10-14 @ tau_c 0.05 = tau 0.5-0.7).
+-_AUDIO_TAU_C_CEILING = 0.95
+ 
+ # H3 has no hard RoPE wall, but the model is trained on ~124-362 px frames
+ # (~5-15 s at 24 fps).  Keep each sampling window (overlap + new) at or under
+@@ -439,33 +431,22 @@ class CLSSH3Config:
+                                       "tooltip": "SLB size in video latent tokens shared between consecutive chunks, snapped to the 5k+2 grid (2, 7, 12, …; 7 tokens ≈ 22 px frames ≈ 0.9 s at 24 fps) — the hard temporal context the model sees from the previous chunk. Auto-clamped down (in steps of 5) at runtime so overlap+new stays under the 12 s window cap.",
+                                       }),
+             },
+-            "optional": {
+-                "anchor_top_m": ("INT", {"default": 0, "min": 0, "max": 8,
+-                                      "tooltip": "§2.5 identity anchors pinned as keyframe rows at the window's frame 0. DEFAULT 0 = OFF: in a streaming run the SLB overlap already pins the true previous tail at frame 0, and anchor keyframes at the same coordinate are contradictory stale context that drags the scene backward as the bank grows (measured: scene morph halfway through a 10-chunk run). Only meaningful for runs with overlap disabled.",
+-                                      }),
+-                "noise_temporal_corr": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 0.8, "step": 0.05,
+-                                      "tooltip": "Temporally-correlated video noise: mixes a run-constant shared frame into every noise frame, n_t = sqrt(1-a)·eps_t + sqrt(a)·eps_shared, keeping each frame's marginal exactly N(0,1) while raising frame-to-frame noise correlation (FreeNoise/PYoCo family). Video stream only. Targets the measured ~4 s layout oscillation. 0 = off.",
+-                                      }),
+-            },
+         }
+     RETURN_TYPES = ("CLSS_CONFIG",)
+     RETURN_NAMES = ("clss_config",)
+     FUNCTION = "build"
+     CATEGORY = "MiniMaxH3-CLSS"
+ 
+-    def build(self, tau_c, beta, overlap, noise_temporal_corr=0.0, anchor_top_m=0):
++    def build(self, tau_c, beta, overlap):
+         # Validated-production values carried over from the LTX node layer;
+         # the dataclass defaults in clss.py are the paper's, not ours.
+         return (CLSSConfig(
+             tau_c=tau_c,
+             beta=beta,
+-            anchor_top_m=anchor_top_m,
+             ema_lambda=0.10,
+             ema_sigma_max_drift=0.05,
+-            anchor_force_every=0,  # 0 = auto: the sampler derives ceil(chunks/4) clamped to [2, 5]
+             overlap_latent_frames=_snap_overlap(overlap),
+             adain_max_amplification=1.2,
+-            noise_temporal_corr=noise_temporal_corr,
+         ),)
+ 
+ 
+@@ -692,7 +673,7 @@ class CLSSH3StreamingSampler:
+                 "sigmas":      ("SIGMAS",      {"tooltip": "SIGMAS schedule (e.g. BasicScheduler). This is the video schedule; the audio schedule is derived from it inside the model."}),
+                 "noise":       ("NOISE",       {"tooltip": "NOISE source (RandomNoise). Its seed drives the run-constant full-length noise tensors that each chunk's initial noise is sliced from."}),
+                 "latent":      ("LATENT",      {"tooltip": "Per-chunk AV latent template from EmptyMiniMaxH3LatentAV (NestedTensor video [B,24,T,H/16,W/16] + audio [B,32,2,Ta]). Its frame count sets the per-chunk length; total length = num_chunks × chunk. T must be on the 5k+2 grid (the stock node guarantees this)."}),
+-                "clss_config": ("CLSS_CONFIG", {"tooltip": "CLSS_CONFIG from the CLSSH3Config node (tau_c, beta, overlap, noise_temporal_corr)."}),
++                "clss_config": ("CLSS_CONFIG", {"tooltip": "CLSS_CONFIG from the CLSSH3Config node (tau_c, beta, overlap)."}),
+                 "num_chunks":  ("INT",         {"default": 10, "min": 1, "max": 500,
+                                                 "tooltip": "Number of streaming chunks; total video length = num_chunks × chunk length (chunk 0 covers 17k+5 px, each continuation 17k px). A chunk whose window (overlap+new) would exceed the 12 s cap is auto-split into uniform grid-aligned sub-chunks. With scene_handoff=transition_chunk every scene block needs ≥ 2 chunks, i.e. num_chunks ≥ 2×scenes.",
+                                                 }),
+@@ -712,20 +693,9 @@ class CLSSH3StreamingSampler:
+                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.25,
+                     "tooltip": "Scales the video overlap re-noise: effective tau_c × this, still rising toward the 0.10 ceiling with the 5-chunk half-life. 0 = frozen clean seam (no re-noising of the video overlap).",
+                     }),
+-                # < 0: the audio overlap regenerates freely (best musical continuity),
+-                # but the last |value| SECONDS of the previous tail stay frozen at the
+-                # end of the overlap.  If |value| rounds to 0 audio frames the pin
+-                # vanishes entirely: H3-Motion-Context mode (guide-only context,
+-                # plain cut at the join, no crossfade).
+-                # 0 = SLB placed fully frozen, > 0 = SLB re-noised with tau_c*mult
+-                # (tau = model share; ceiling 0.95).
+-                "audio_slb_tau_mult": ("FLOAT", {
+-                    "default": -0.01, "min": -4.0, "max": 20.0, "step": 0.01,
+-                    "tooltip": "Audio SLB handling. tau is the MODEL's share of the blend (out = tau*model + (1-tau)*tail every step). 0 = overlap fully frozen. > 0 = re-noise with tau = tau_c×mult rising toward the 0.95 ceiling — the light-re-noise groove range is tau 0.5-0.7 (mult 10-14 at tau_c 0.05): the tail rides the target rows at 30-50% weight as musical context without freezing. < 0 = overlap regenerates freely but the last |value| SECONDS of the previous tail stay pinned frozen at the end of the overlap; if |value| < 1 audio frame (0.025 s) the pin rounds to zero and you get the H3-Motion-Context recipe: no target-row audio context at all, the guide is the only context, plain cut at the join (no crossfade) — their measured seam continuity is 0.95. Do NOT combine a fully re-rendered overlap with a long guide: measured on a 10-chunk chain it copies the guide's motif (looping).",
+-                    }),
+                 "audio_guide_seconds": ("FLOAT", {
+                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.25,
+-                    "tooltip": "Audio seam guide: pins the last N seconds of the previous chunk's audio as a cond_audio guide keyframe whose window ENDS exactly at the join and reaches BACKWARD (fractional/negative anchor index — the H3-Motion-Context pack's measured mechanism: seam correlation 0.45 -> 0.95+ vs reference placement; a forward/overlap-aligned guide makes the model loop the motif instead). Pair with audio_slb_tau_mult < 0: with -0.3 a 12-frame frozen pin glues the cut; with |mult| < 0.025 you get the pack's exact recipe (guide-only context, plain cut). 1.0 s = 40 latent steps, the pack's validated default. 0 = off. Requires ComfyUI 0.34.0+ (fractional/negative keyframe anchors).",
++                    "tooltip": "Audio seam guide: pins the last N seconds of the previous chunk's audio as a cond_audio guide keyframe whose window ENDS exactly at the join and reaches BACKWARD (fractional/negative anchor index — the H3-Motion-Context pack's measured mechanism: seam correlation 0.45 -> 0.95+ vs reference placement; a forward/overlap-aligned guide makes the model loop the motif instead). The guide is the ONLY audio context: the overlap rows are fresh noise and the join is a plain cut. 1.0 s = 40 latent steps, the pack's validated default. 0 = off. Requires ComfyUI 0.34.0+ (fractional/negative keyframe anchors).",
+                     }),
+                 "audio_cfg_cont": ("FLOAT", {
+                     "default": 1.0, "min": 1.0, "max": 30.0, "step": 0.5,
+@@ -764,8 +734,7 @@ class CLSSH3StreamingSampler:
+         fps: float = 24.0,
+         detail_anchor: str = "on",
+         video_slb_tau_mult: float = 1.0,
+-        audio_slb_tau_mult: float = 0.0,
+-        audio_guide_seconds: float = 3.0,
++        audio_guide_seconds: float = 1.0,
+         audio_cfg_cont: float = 1.0,
+         scene_handoff: str = "transition_chunk",
+     ):
+@@ -870,10 +839,6 @@ class CLSSH3StreamingSampler:
+         T_total, Ta_total = _t_acc, _a_acc
+         Ta_ol = _af_of_px(px_ol)
+ 
+-        if clss_config.anchor_force_every <= 0:
+-            _auto_anchor = max(2, min(5, math.ceil(_eff_num_chunks / 4)))
+-            clss_config = dataclasses.replace(clss_config, anchor_force_every=_auto_anchor)
+-
+         # ---- scene hand-off plan (_cond_plan), one entry per chunk:
+         #   int               → chunk guided by that scene's prompt alone
+         #   (int, int, float) → crossfade chunk guided by the embedding blend of
+@@ -902,26 +867,6 @@ class CLSSH3StreamingSampler:
+                           _VIDEO_TAU_C_CEILING, 0)
+         _tvN = _tau_c_eff(clss_config.tau_c * video_slb_tau_mult,
+                           _VIDEO_TAU_C_CEILING, max(0, _eff_num_chunks - 2))
+-        if audio_slb_tau_mult < 0.0:
+-            _bn_pin = min(round(-audio_slb_tau_mult * AUDIO_LATENT_FPS), Ta_ol)
+-            if _bn_pin > 0:
+-                _a_mode = (f"FREE overlap + frozen end-pin {_bn_pin}af "
+-                           f"({_bn_pin / AUDIO_LATENT_FPS:.2f}s)")
+-            else:
+-                _a_mode = ("FREE overlap, NO pin (|mult| < 1 audio frame) + "
+-                           "plain cut at join, NO crossfade — guide is the "
+-                           "ONLY audio context (H3-MC recipe)")
+-        elif audio_slb_tau_mult == 0.0:
+-            _a_mode = "FROZEN overlap (mask 0)"
+-        else:
+-            _ta0 = _tau_c_eff(clss_config.tau_c * audio_slb_tau_mult,
+-                              _AUDIO_TAU_C_CEILING, 0)
+-            _taN = _tau_c_eff(clss_config.tau_c * audio_slb_tau_mult,
+-                              _AUDIO_TAU_C_CEILING, max(0, _eff_num_chunks - 2))
+-            _a_mode = (f"re-noise tau_a {_ta0:.3f}->{_taN:.3f} "
+-                       f"(mask semantics: out = tau*model + (1-tau)*tail EVERY "
+-                       f"step, so tau {_ta0:.2f} = {(1.0 - _ta0) * 100:.0f}% "
+-                       f"tail-clamped)")
+         print("[CLSS] ================ run settings ================")
+         print(f"[CLSS] chunks {_eff_num_chunks} (requested {num_chunks}) | "
+               f"scenes {num_scenes} handoff={scene_handoff} | "
+@@ -933,14 +878,13 @@ class CLSSH3StreamingSampler:
+               f"({_win_px / fps:.2f}s, cap {cap_px}px) | "
+               f"total ~{Ta_total / AUDIO_LATENT_FPS:.1f}s audio")
+         print(f"[CLSS] video SLB tau_v {_tv0:.3f}->{_tvN:.3f} "
+-              f"(ceiling {_VIDEO_TAU_C_CEILING}) | audio SLB: {_a_mode}")
++              f"(ceiling {_VIDEO_TAU_C_CEILING}) | audio: free overlap + "
++              f"end-aligned guide, plain cut (no audio SLB — H3-MC mode)")
+         print(f"[CLSS] guide {audio_guide_seconds:.2f}s = "
+               f"{round(audio_guide_seconds * AUDIO_LATENT_FPS)}af end-aligned at "
+               f"join | detail_anchor {detail_anchor} | clss tau_c "
+               f"{clss_config.tau_c} beta {getattr(clss_config, 'beta', '?')} "
+-              f"overlap {clss_config.overlap_latent_frames}tok ntc "
+-              f"{clss_config.noise_temporal_corr} anchors top_m="
+-              f"{clss_config.anchor_top_m} every={clss_config.anchor_force_every}")
++              f"overlap {clss_config.overlap_latent_frames}tok")
+         print(f"[CLSS] sigmas {_s.numel() - 1} steps "
+               f"[{float(_s[0]):.3f}..{float(_s[-1]):.3f}] | cfg v="
+               f"{getattr(guider, '_video_cfg', '?')} a="
+@@ -986,23 +930,6 @@ class CLSSH3StreamingSampler:
+         _noise_tmpl = torch.zeros(B, C_v, T_total, H, W)
+         _full_noise_vid: torch.Tensor = noise.generate_noise({"samples": _noise_tmpl})
+         del _noise_tmpl
+-        _ntc = float(getattr(clss_config, "noise_temporal_corr", 0.0))
+-        if _ntc > 0.0:
+-            # §-noise: mix a run-constant shared frame into every video noise
+-            # frame, n_t = sqrt(1-a)·eps_t + sqrt(a)·eps_shared — each frame's
+-            # marginal stays exactly N(0,1) while frame-to-frame correlation
+-            # rises to a at all lags (FreeNoise/PYoCo family).  Video only.
+-            _g_shared = torch.Generator(device="cpu").manual_seed(
+-                (int(_noise_seed) + 2) % (2 ** 63))
+-            _eps_shared = torch.randn(
+-                _full_noise_vid.shape[0], _full_noise_vid.shape[1], 1,
+-                _full_noise_vid.shape[3], _full_noise_vid.shape[4],
+-                generator=_g_shared, dtype=_full_noise_vid.dtype,
+-            ).to(_full_noise_vid.device)
+-            _full_noise_vid = (
+-                math.sqrt(1.0 - _ntc) * _full_noise_vid
+-                + math.sqrt(_ntc) * _eps_shared
+-            )
+         _g_aud = torch.Generator(device="cpu").manual_seed(
+             (int(_noise_seed) + 1) % (2 ** 63))
+         _full_noise_aud = torch.randn(B_a, C_a, lanes_a, Ta_total,
+@@ -1012,7 +939,6 @@ class CLSSH3StreamingSampler:
+         acc_video: list[torch.Tensor] = []
+         acc_audio: list[torch.Tensor] = []
+         audio_chunk_ends: list[int] = []
+-        audio_slb_latent: torch.Tensor | None = None
+         # rolling kept-audio history (CPU, ends at the current join) — the
+         # source of the end-aligned guide window (see audio_guide_seconds)
+         _audio_tail: torch.Tensor | None = None
+@@ -1029,9 +955,9 @@ class CLSSH3StreamingSampler:
+         _hist_scene_start = 0
+         _s1_audio_freq_ref: list[float] | None = None
+         _trend = {
+-            "vid_std": [], "vid_ident": [], "vid_intra": [], "vid_bnd": [],
++            "vid_std": [], "vid_intra": [], "vid_bnd": [],
+             "vid_hf": [], "vid_origin": [],
+-            "aud_env": [], "aud_rms": [], "aud_bnd": [], "aud_slb": [],
++            "aud_env": [], "aud_rms": [], "aud_bnd": [],
+             "aud_dlv": [], "aud_lvl": [],
+             "aud_wc": [], "aud_hf": [], "aud_hf_raw": [],
+             "aud_peak": [], "aud_step": [], "aud_lag": [], "aud_lagf": [],
+@@ -1070,53 +996,19 @@ class CLSSH3StreamingSampler:
+                 clss_state.reset_drift_refs()
+             _prev_scene_idx = scene_idx
+             has_slb = not is_first and clss_state.overlap_latent is not None
+-            has_aud_slb = not is_first and audio_slb_latent is not None
+ 
+             # ---- conditioning: scene (+ crossfade blend) + keyframe rows ----
+             keyframes: list[dict] = []
+             if is_first and img_guide_latent is not None:
+                 keyframes.append({"resolved_frame_index": 0, "latent": img_guide_latent})
+-            if (not is_first and clss_config.anchor_top_m > 0 and clss_state.overlap_latent is None):
+-                # §2.5 anchors are DISABLED whenever the SLB overlap is live
+-                # (every chunk > 0 in a streaming run).  Both pin the window's
+-                # frame 0: the mask pins the TRUE previous tail there while an
+-                # anchor keyframe claims the same coordinate looks like a frame
+-                # from N chunks ago — contradictory near-clean context,
+-                # re-injected EVERY denoising step, and growing: the bank adds
+-                # a forced anchor every anchor_force_every chunks regardless of
+-                # content (10-chunk run: 4 anchors by chunk 9, all at frame 0).
+-                # Measured: the video morphs toward the stale anchor scene as
+-                # the bank grows; at chunk 9 the render collapsed onto an
+-                # anchor frame bit-exactly (last_frame_max_sim=1.0000).
+-                # Continuity must flow from the last known GOOD frames — that
+-                # is the overlap's job; long-run identity is carried by the
+-                # §2.3 EMA and the per-scene std/detail anchors.  The bank is
+-                # still updated below for vid_ident telemetry; set
+-                # anchor_top_m>0 only for runs WITHOUT an overlap.
+-                for _a in clss_state.top_anchors():
+-                    keyframes.append({"resolved_frame_index": 0, "latent": _a.latent})
+             # ---- audio seam guide: cond_audio keyframe, END-aligned at the
+             # join and reaching BACKWARD (H3-Motion-Context's measured
+-            # mechanism) ----
+-            # What was tried and measured on H3 before this:
+-            #  - bare frozen in-latent SLB: aud_bnd ≈ 0.2-0.35 — the model
+-            #    treats masked-in audio rows as output, not context;
+-            #  - minimax_refs pre-window block: "cover band" effect (their
+-            #    words — same groove, never the same recording; aud_bnd
+-            #    ≈ 0.3) and the ref span shifts the whole target RoPE
+-            #    origin, which measurably hurt video;
+-            #  - guide keyframe OVERLAID on the frozen overlap: the model
+-            #    loops the pinned motif across every following chunk.
+-            # What works (their pack, seam correlation 0.45 -> 0.95+): the
+-            # pinned audio window must END at the join and reach backward
+-            # into audio that already played — a fractional, negative
+-            # resolved_frame_index, legal PackedLayout arithmetic that no
+-            # stock node produces.  The overlap itself must be RE-RENDERED
+-            # (re-noised SLB, audio_slb_tau_mult > 0), never frozen under
+-            # the guide.  The join sits at window audio position _Ta_ol_w —
+-            # already an integer on the 40 Hz grid, so no end snapping is
+-            # needed (their overhang dance exists only because they align
+-            # to a px-frame end instead).
++            # mechanism: seam correlation 0.45 -> 0.95+ vs reference
++            # placement).  The pinned window must end at the join and reach
++            # backward into audio that already played — a fractional,
++            # negative resolved_frame_index, legal PackedLayout arithmetic
++            # that no stock node produces.  The join is already an integer
++            # on the 40 Hz grid, so no end snapping is needed. ----
+             if (not is_first and audio_guide_seconds > 0.0
+                     and _audio_tail is not None):
+                 _join_af = _af_of_px(px_ol + _cur_new_px) - cur_new_af
+@@ -1193,68 +1085,12 @@ class CLSSH3StreamingSampler:
+             _Ta_ol_w = chunk_af - cur_new_af  # window-local audio overlap (≈Ta_ol)
+             lat_aud = torch.zeros(B_a, C_a, lanes_a, chunk_af, device=device)
+             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
+-            _slb_ctx_used: torch.Tensor | None = None
+-            _slb_ctx_pos = 0
+-            # NOTE (measured, 10-chunk chain): with the guide on, do NOT
+-            # fully re-render the audio overlap.  H3-Motion-Context's
+-            # full-fresh head works for 2-4 clip chains of SEPARATE sampler
+-            # runs; inside one chunked run the guide re-pins every chunk and
+-            # a fresh overlap copies the guide's motif (looping, aud_wc ->
+-            # 0.99) while creeping hot (aud_rms +37 % over 10 chunks).  The
+-            # working split: near-frozen SLB (mult +1.0) carries the TRUE
+-            # tail, the end-aligned guide steers the continuation, the
+-            # crossfade hides the residual edge, and the RMS anchor below
+-            # breaks the energy spiral.
+-            if has_aud_slb and audio_slb_tau_mult >= 0.0:
+-                slb = audio_slb_latent.to(device)
+-                n = min(_Ta_ol_w, slb.shape[-1], chunk_af)
+-                # END-align the SLB at the join: window row _Ta_ol_w is
+-                # delivered as the first NEW frame, so the overlap rows
+-                # [0, _Ta_ol_w) cover delivered positions [E-_Ta_ol_w, E)
+-                # and the matching tail content is the SLB's LAST n frames.
+-                # Start-aligning (slb[..., :n] at row 0) writes the tail one
+-                # audio frame (25 ms) EARLY whenever the window rounding
+-                # lands _Ta_ol_w = Ta_ol - 1 (e.g. 22 px overlap + 238 px
+-                # chunks) and drops the true last frame — the model then
+-                # continues from content 25 ms in the past and the crossfade
+-                # smears the phase-shifted copy across the seam (measured:
+-                # aud_dlv 0.13, WORSE than the raw edge aud_bnd 0.26).
+-                # Video never hits this: its overlap is exact on the 5k+2
+-                # token grid, only the audio 5/3 rescale rounds.
+-                _slb_ctx_pos = _Ta_ol_w - n
+-                _slb_ctx = slb[..., -n:]
+-                lat_aud[..., _slb_ctx_pos:_Ta_ol_w] = _slb_ctx
+-                if audio_slb_tau_mult > 0.0:
+-                    _tau_c_a = _tau_c_eff(clss_config.tau_c * audio_slb_tau_mult,
+-                                          _AUDIO_TAU_C_CEILING, chunk_idx - 1)
+-                    _cfg_a = f"aud=tau{_tau_c_a:.3f}"
+-                else:
+-                    _tau_c_a = 0.0
+-                    _cfg_a = "aud=FROZEN"
+-                mask_aud[..., _slb_ctx_pos:_Ta_ol_w] = _tau_c_a
+-                _slb_ctx_used = _slb_ctx.detach().cpu()
+-            elif has_aud_slb:
+-                # audio_slb_tau_mult < 0: regenerate the overlap freely (best
+-                # musical continuity — a fully frozen SLB drags the whole window
+-                # toward an exact repeat of the tail), but pin the last |mult|
+-                # SECONDS of the previous tail frozen at the END of the overlap.
+-                # Without the pin the vocal phrase restarts at every chunk
+-                # boundary: words are cut mid-phoneme and the singing goes dead.
+-                # The pinned frames sit immediately before the kept region, so
+-                # they glue the seam without constraining the rest of the window.
+-                slb = audio_slb_latent.to(device)
+-                n = min(_Ta_ol_w, slb.shape[-1], chunk_af)
+-                _pin_af = min(round(-audio_slb_tau_mult * AUDIO_LATENT_FPS), n)
+-                _cfg_a = "aud=FREE+cut"  # pin rounds to 0: H3-MC mode
+-                if _pin_af > 0:
+-                    # end-aligned like the SLB above: the pinned frames must
+-                    # sit in the rows immediately before the kept region.
+-                    _slb_ctx_pos = _Ta_ol_w - _pin_af
+-                    _slb_ctx = slb[..., -_pin_af:]
+-                    lat_aud[..., _slb_ctx_pos:_Ta_ol_w] = _slb_ctx
+-                    mask_aud[..., _slb_ctx_pos:_Ta_ol_w] = 0.0
+-                    _slb_ctx_used = _slb_ctx.detach().cpu()
+-                    _cfg_a = f"aud=FREE+pin{_pin_af}af"
++            # Audio rows stay 100% fresh noise under an all-ones mask: the
++            # previous tail's only presence is the cond_audio guide keyframe
++            # above, and the rendered overlap is trimmed with a plain cut
++            # (H3-Motion-Context's recipe — no audio SLB, no crossfade).
++            if not is_first:
++                _cfg_a = "aud=free"
+             chunk_latent = {
+                 "samples": comfy.nested_tensor.NestedTensor((lat_vid, lat_aud)),
+                 "noise_mask": comfy.nested_tensor.NestedTensor((mask_vid, mask_aud)),
+@@ -1356,17 +1192,6 @@ class CLSSH3StreamingSampler:
+                 _trend["vid_prev"].append(float(F.cosine_similarity(
+                     _cur_vfeat, _s1_prev_vfeat.to(device), dim=1).mean()))
+             _s1_prev_vfeat = _cur_vfeat.detach().cpu()
+-            if not is_first:
+-                _cur_feat = F.normalize(corrected[:, :, 0].float().reshape(B, C_v, -1).mean(-1), dim=1)
+-                _bank = clss_state._anchor_bank
+-                if _bank.anchors:
+-                    _trend["vid_ident"].append(max(
+-                        F.cosine_similarity(
+-                            _cur_feat,
+-                            F.normalize(a.feature.unsqueeze(0).to(device), dim=1),
+-                        ).item()
+-                        for a in _bank.anchors
+-                    ))
+             _s1_prev_last = corrected[:, :, -1].cpu()
+ 
+             # ---- audio: keep the new frames, update the audio SLB ----
+@@ -1374,10 +1199,6 @@ class CLSSH3StreamingSampler:
+             if aud_drop > 0 and aud_out.shape[-1] < aud_drop:
+                 aud_drop = 0
+             new_aud = aud_out[..., aud_drop:]
+-            if not is_first and _slb_ctx_used is not None and Ta_ol > 0:
+-                _trend["aud_slb"].append(_aud_cos(
+-                    _slb_ctx_used.to(device),
+-                    aud_out[..., _slb_ctx_pos:_slb_ctx_pos + _slb_ctx_used.shape[-1]]))
+             _env = new_aud.detach().float().pow(2).mean(dim=(0, 1, 2)).cpu()
+             if _prev_aud_env is not None and len(_prev_aud_env) > 8:
+                 _L = min(len(_env), len(_prev_aud_env))
+@@ -1498,81 +1319,22 @@ class CLSSH3StreamingSampler:
+                                for e, r in zip(_freq_e, _s1_audio_freq_ref)]
+                 if len(_freq_ratio) >= 4:
+                     _trend["aud_hf"].append(sum(_freq_ratio[-4:]) / 4.0)
+-            if Ta_ol > 0:
+-                audio_slb_latent = (new_aud[..., -Ta_ol:] if new_aud.shape[-1] >= Ta_ol
+-                                    else new_aud).cpu()
+             # roll the audio history forward (final kept audio, post fade/clip);
+-            # bounded to the SLB + the longest guide window the widget allows.
++            # bounded to the longest guide window the widget allows.
+             _audio_tail = (new_aud.cpu() if _audio_tail is None
+                            else torch.cat([_audio_tail, new_aud.cpu()], dim=-1))
+-            _tail_keep = Ta_ol + max(0, round(audio_guide_seconds * AUDIO_LATENT_FPS))
+-            if _tail_keep > 0 and _audio_tail.shape[-1] > _tail_keep:
++            _tail_keep = max(1, round(audio_guide_seconds * AUDIO_LATENT_FPS))
++            if _audio_tail.shape[-1] > _tail_keep:
+                 _audio_tail = _audio_tail[..., -_tail_keep:]
+-            # ---- soft seam: blend the previous tail with the window's
+-            # RE-RENDERED overlap instead of hard-cutting to the new frames ----
+-            # Every hard-edged audio config measured discontinuous on H3
+-            # (aud_bnd ≈ 0.2-0.35): in-stream frozen audio rows are an
+-            # untrained configuration — the model cannot join new content to
+-            # their end.  With a re-noised SLB (audio_slb_tau_mult > 0, the
+-            # LTX/CLSS soft boundary — what the working VIDEO seam uses) the
+-            # model re-renders the overlap so it FLOWS into the new content,
+-            # and this linear blend of the old tail with that re-rendered span
+-            # removes the residual edge at the join.  With a frozen SLB
+-            # (mult = 0) both versions are identical (aud_slb = 1.0) and the
+-            # blend is an exact no-op.
+-            if aud_drop > 0 and acc_audio:
+-                _n_xf = min(aud_drop, acc_audio[-1].shape[-1])
+-                if audio_slb_tau_mult < 0.0 and _slb_ctx_used is None:
+-                    # pin-less FREE mode (|mult| < 1 audio frame -> pin rounds
+-                    # to 0): no target-row audio context at all — the guide
+-                    # keyframe is the ONLY audio context.  This is H3-MC's
+-                    # measured-good recipe (0.95 waveform continuity across
+-                    # clips) and they trim with NO crossfade: blending the
+-                    # free overlap back in would smear two independent
+-                    # renders of the same span across the join.  Plain cut.
+-                    _n_xf = 0
+-                elif audio_slb_tau_mult <= 0.0 and _slb_ctx_used is not None:
+-                    # frozen pin: only the pinned span holds previous-tail
+-                    # content.  mult=0: the whole SLB is frozen, and window
+-                    # rounding (_Ta_ol_w vs Ta_ol, ±1 af) can drop one frame
+-                    # BEYOND the pinned span — blending toward that fresh
+-                    # render would splice the preserved tail.  mult<0: only
+-                    # the last |mult| seconds are frozen; blending over the
+-                    # FREE part of the overlap smears two independent renders
+-                    # of the same ~0.9 s across the join (the clearly audible
+-                    # seam wash).  Cap the blend to the pinned span — the pin
+-                    # frames are bit-exact on both sides, so the blend becomes
+-                    # a near-noop and the seam is the model's OWN continuation
+-                    # flowing out of the frozen pin (H3-MC's approach: pin,
+-                    # continue, trim — no crossfade).
+-                    _n_xf = min(_n_xf, _slb_ctx_used.shape[-1])
+-                if _n_xf > 0:  # pin-less FREE mode: plain cut, no blend at all
+-                    _w_xf = torch.linspace(0.0, 1.0, _n_xf,
+-                                           dtype=acc_audio[-1].dtype).view(1, 1, 1, -1)
+-                    _prev_kept = acc_audio[-1]
+-                    # the blend source is the LAST _n_xf frames of the dropped
+-                    # span — the rows abutting the kept region, aligned with the
+-                    # tail's last _n_xf frames (both cover delivered
+-                    # [E-_n_xf, E)).  Differs from aud_out[..., :_n_xf] whenever
+-                    # _n_xf < aud_drop (frozen cap or short acc).
+-                    _xf_src = aud_out[..., aud_drop - _n_xf:aud_drop]
+-                    # no in-place write: on CPU-only runs new_aud.cpu() aliases
+-                    # and an in-place blend would retroactively rewrite
+-                    # audio_slb_latent and _audio_tail (the guide's source)
+-                    # with delivered values.
+-                    acc_audio[-1] = torch.cat([
+-                        _prev_kept[..., :-_n_xf],
+-                        _prev_kept[..., -_n_xf:] * (1.0 - _w_xf)
+-                        + _xf_src.cpu().to(_prev_kept.dtype) * _w_xf,
+-                    ], dim=-1)
+             if not is_first and acc_audio and new_aud.shape[-1] > 0:
+-                # DELIVERED seam (post-crossfade) — what the listener actually
+-                # gets.  aud_bnd above measures the raw pre-blend edge of the
+-                # model's continuation; aud_dlv measures the seam after the
+-                # soft-seam blend, aud_lvl the 1 s RMS level step across it
+-                # in dB (0 = no step; the audible "the room tone jumped"
+-                # failure).  Concept stolen from H3-Motion-Context's Seam
+-                # Probe (correlation / RMS step / floor step across a join).
++                # DELIVERED seam — what the listener actually gets.  aud_bnd
++                # above measures the raw edge of the model's continuation
++                # before the level/spectral anchors; aud_dlv measures the
++                # delivered seam after them, aud_lvl the 1 s RMS level step
++                # across it in dB (0 = no step; the audible "the room tone
++                # jumped" failure).  Concept stolen from H3-Motion-Context's
++                # Seam Probe (correlation / RMS step / floor step across a
++                # join).
+                 _trend["aud_dlv"].append(_aud_cos(
+                     acc_audio[-1][..., -1:].to(device), new_aud[..., :1]))
+                 _Lw = min(round(AUDIO_LATENT_FPS), acc_audio[-1].shape[-1],
