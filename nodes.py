@@ -67,6 +67,7 @@ import comfy.nested_tensor
 import comfy.samplers
 import comfy.utils
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
+from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from comfy_extras.nodes_minimax_h3 import AUDIO_LATENT_FPS, FPS as _NATIVE_FPS
 
@@ -512,6 +513,91 @@ class CLSSH3ScenePrompts:
 # ---------------------------------------------------------------------------
 
 
+def _encode_ref_image_pair(vae, image, ref_image_size, width, height):
+    """Stock ref2va image encode: downscale-only sizing, canvas multiple 32.
+    Returns (tokenizer item, minimax_refs block)."""
+    h, w = image.shape[1], image.shape[2]
+    if ref_image_size == "match":
+        scale = min(1.0, math.sqrt((width * height) / (w * h)))
+    else:
+        scale = min(1.0, _REF_IMAGE_SHORT_EDGE / min(w, h))
+    tw = max(32, round(w * scale / 32) * 32)
+    th = max(32, round(h * scale / 32) * 32)
+    resized = comfy.utils.common_upscale(
+        image[:1, ..., :3].movedim(-1, 1), tw, th, "lanczos", "disabled"
+    ).movedim(1, -1)
+    z = vae.encode(resized)
+    return ({"type": "image", "data": resized},
+            {"kind": "image", "latent_h": th // 16, "latent_w": tw // 16,
+             "latent": z})
+
+
+def _encode_ref_audio_pair(audio_vae, audio):
+    """Stock _encode_ref_audio: resample to the VAE's rate, encode batch 1 as
+    [1, L, C]; ref_audio_t = latent frames (40 Hz)."""
+    waveform = audio["waveform"]
+    sr = audio["sample_rate"]
+    vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+    if sr != vae_sr:
+        import torchaudio
+        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+    z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
+    return ({"type": "audio"},
+            {"kind": "audio", "ref_audio_t": z.shape[-1], "audio_latent": z})
+
+
+def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
+    """Merge new (item, block) pairs into ONE scene's conditioning entry and
+    re-tokenize the scene text with the full reference presentation.
+
+    Refs accumulate with any already on the scene and are presented in the
+    stock order (images first, then audios), so <Picture N>/<Audio N> labels
+    follow each type's input order regardless of wiring order.  Scenes without
+    refs stay reference-free — refs on scene 2 never leak into scene 1.
+    """
+    if not new_pairs:
+        raise ValueError("connect at least one image and/or audio reference")
+    idx = scene_index - 1
+    if not 0 <= idx < len(conditioning):
+        raise ValueError(f"scene_index {scene_index} is out of range — the "
+                         f"conditioning holds {len(conditioning)} scene(s)")
+    prev = conditioning[idx][1]
+    text = prev.get("clss_scene_text")
+    if text is None:
+        raise ValueError("scene references can only attach to conditioning "
+                         "from CLSSH3ScenePrompts (the scene's raw text is "
+                         "needed to re-tokenize it with the reference "
+                         "presentation).")
+    prev_items = prev.get("clss_ref_items", [])
+    prev_blocks = prev.get("minimax_refs", [])
+    if len(prev_items) != len(prev_blocks):
+        raise ValueError("the scene already carries minimax_refs from a "
+                         "foreign node without the matching tokenizer "
+                         "presentation — attach refs with the CLSS ref "
+                         "nodes only")
+    pairs = list(zip(prev_items, prev_blocks)) + new_pairs
+    pairs.sort(key=lambda p: 0 if p[1]["kind"] == "image" else 1)
+    items = [p[0] for p in pairs]
+    blocks = [p[1] for p in pairs]
+
+    tokens = clip.tokenize(text, minimax_ref_items=items)
+    encoded = clip.encode_from_tokens_scheduled(tokens)
+    nt, nd = encoded[0]
+    nd = dict(nd)
+    nd["minimax_refs"] = blocks
+    nd["clss_ref_items"] = items
+    nd["clss_scene_text"] = text
+    out = list(conditioning)
+    out[idx] = [nt, nd]
+    ni = sum(1 for b in blocks if b["kind"] == "image")
+    na = sum(1 for b in blocks if b["kind"] == "audio")
+    print(f"[CLSS] scene {scene_index}: R2V refs = {ni} image(s) + "
+          f"{na} audio(s) — prompt labels <Picture 1..{ni}> / "
+          f"<Audio 1..{na}>; scene re-tokenized with the ref presentation. "
+          f"Ref tokens ride every chunk of scene {scene_index}.")
+    return out
+
+
 class CLSSH3SceneReference:
     """Attach R2V references (image and/or audio) to ONE scene's conditioning.
 
@@ -557,87 +643,85 @@ class CLSSH3SceneReference:
     def generate(self, clip, conditioning, scene_index, image=None, audio=None,
                  vae=None, audio_vae=None, ref_image_size="match",
                  width=1344, height=768):
-        if image is None and audio is None:
-            raise ValueError("CLSSH3SceneReference needs an image and/or an "
-                             "audio reference connected")
         if image is not None and vae is None:
             raise ValueError("encoding a reference image needs the vae input")
         if audio is not None and audio_vae is None:
             raise ValueError("encoding a reference audio needs the audio_vae input")
-        idx = scene_index - 1
-        if not 0 <= idx < len(conditioning):
-            raise ValueError(f"scene_index {scene_index} is out of range — the "
-                             f"conditioning holds {len(conditioning)} scene(s)")
-        prev = conditioning[idx][1]
-        text = prev.get("clss_scene_text")
-        if text is None:
-            raise ValueError("CLSSH3SceneReference can only attach to "
-                             "conditioning from CLSSH3ScenePrompts (the scene's "
-                             "raw text is needed to re-tokenize it with the "
-                             "reference presentation).")
-
         new_pairs = []
         if image is not None:
-            # stock ref2va image sizing: downscale only, canvas multiple 32
-            h, w = image.shape[1], image.shape[2]
-            if ref_image_size == "match":
-                scale = min(1.0, math.sqrt((width * height) / (w * h)))
-            else:
-                scale = min(1.0, _REF_IMAGE_SHORT_EDGE / min(w, h))
-            tw = max(32, round(w * scale / 32) * 32)
-            th = max(32, round(h * scale / 32) * 32)
-            resized = comfy.utils.common_upscale(
-                image[:1, ..., :3].movedim(-1, 1), tw, th, "lanczos", "disabled"
-            ).movedim(1, -1)
-            z = vae.encode(resized)
-            new_pairs.append(({"type": "image", "data": resized},
-                              {"kind": "image", "latent_h": th // 16,
-                               "latent_w": tw // 16, "latent": z}))
+            new_pairs.append(_encode_ref_image_pair(
+                vae, image, ref_image_size, width, height))
         if audio is not None:
-            # stock _encode_ref_audio: resample to the VAE's rate, encode
-            # batch 1 as [1, L, C]; ref_audio_t = latent frames (40 Hz)
-            waveform = audio["waveform"]
-            sr = audio["sample_rate"]
-            vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
-            if sr != vae_sr:
-                import torchaudio
-                waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
-            z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
-            new_pairs.append(({"type": "audio"},
-                              {"kind": "audio", "ref_audio_t": z.shape[-1],
-                               "audio_latent": z}))
+            new_pairs.append(_encode_ref_audio_pair(audio_vae, audio))
+        return (_attach_scene_refs(clip, conditioning, scene_index, new_pairs),)
 
-        # accumulate with refs already on the scene, then present in the stock
-        # order (images first, then audios) so <Picture N>/<Audio N> labels
-        # follow each type's chain order regardless of wiring order.
-        prev_items = prev.get("clss_ref_items", [])
-        prev_blocks = prev.get("minimax_refs", [])
-        if len(prev_items) != len(prev_blocks):
-            raise ValueError("the scene already carries minimax_refs from a "
-                             "foreign node without the matching tokenizer "
-                             "presentation — attach refs with "
-                             "CLSSH3SceneReference only")
-        pairs = list(zip(prev_items, prev_blocks)) + new_pairs
-        pairs.sort(key=lambda p: 0 if p[1]["kind"] == "image" else 1)
-        items = [p[0] for p in pairs]
-        blocks = [p[1] for p in pairs]
 
-        tokens = clip.tokenize(text, minimax_ref_items=items)
-        encoded = clip.encode_from_tokens_scheduled(tokens)
-        nt, nd = encoded[0]
-        nd = dict(nd)
-        nd["minimax_refs"] = blocks
-        nd["clss_ref_items"] = items
-        nd["clss_scene_text"] = text
-        out = list(conditioning)
-        out[idx] = [nt, nd]
-        ni = sum(1 for b in blocks if b["kind"] == "image")
-        na = sum(1 for b in blocks if b["kind"] == "audio")
-        print(f"[CLSS] scene {scene_index}: R2V refs = {ni} image(s) + "
-              f"{na} audio(s) — prompt labels <Picture 1..{ni}> / "
-              f"<Audio 1..{na}>; scene re-tokenized with the ref presentation. "
-              f"Ref tokens ride every chunk of scene {scene_index}.")
-        return (out,)
+class CLSSH3SceneReferences(io.ComfyNode):
+    """Multi-ref version: ALL of one scene's reference images/audios in a
+    single node (V3 Autogrow sockets, like the stock MiniMaxH3ReferenceToVideo).
+
+    ref_image_1..N bind to <Picture 1..N>, ref_audio_1..M to <Audio 1..M> —
+    socket order IS the label order.  Chain after CLSSH3SceneReference nodes
+    if you must mix; refs accumulate per scene (images first, then audios).
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CLSSH3SceneReferences",
+            display_name="CLSS H3 Scene References (R2V multi)",
+            category="MiniMaxH3-CLSS",
+            description="Attach multiple R2V reference images/audios to ONE scene's conditioning. ref_image_1..N -> <Picture 1..N>, ref_audio_1..M -> <Audio 1..M> in the scene's prompt text.",
+            inputs=[
+                io.Conditioning.Input("conditioning", tooltip="Per-scene CONDITIONING from CLSSH3ScenePrompts (directly or through other CLSS ref nodes)."),
+                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B). The scene's text is re-tokenized with the reference presentation so the <Picture N>/<Audio N> labels bind."),
+                io.Int.Input("scene_index", default=2, min=1, max=64,
+                             tooltip="1-based scene these references belong to (scene 2 = the second '---' block). Only that scene's chunks carry the refs."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when any ref_image is connected."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio is connected."),
+                io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
+                    tooltip="Reference image sizing (stock ref2va rule). match: aspect-preserving downscale (never upscale) to the generation's pixel area — set width/height to your EmptyMiniMaxH3LatentAV size. max: 2048 px short edge, best identity fidelity — but ref tokens ride EVERY chunk of the scene, so max can be several times slower."),
+                io.Int.Input("width", default=1344, min=32, max=8192, step=32, optional=True,
+                             tooltip="Generation canvas width — only used by ref_image_size=match."),
+                io.Int.Input("height", default=768, min=32, max=8192, step=32, optional=True,
+                             tooltip="Generation canvas height — only used by ref_image_size=match."),
+                io.Autogrow.Input("ref_images", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("ref_image", tooltip="Reference image (identity/style/composition anchor). Socket order = <Picture N> order."),
+                        prefix="ref_image_", min=0, max=9)),
+                io.Autogrow.Input("ref_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("ref_audio", tooltip="Reference audio (voice/beat/texture anchor). Socket order = <Audio N> order."),
+                        prefix="ref_audio_", min=0, max=3)),
+            ],
+            outputs=[io.Conditioning.Output(display_name="conditioning")],
+        )
+
+    @classmethod
+    @torch.inference_mode()
+    def execute(cls, conditioning, clip, scene_index, vae=None, audio_vae=None,
+                ref_image_size="match", width=1344, height=768,
+                ref_images=None, ref_audios=None):
+        ref_images = {k: v for k, v in (ref_images or {}).items()
+                      if v is not None}
+        ref_audios = {k: v for k, v in (ref_audios or {}).items()
+                      if v is not None}
+        if ref_images and vae is None:
+            raise ValueError("encoding reference images needs the vae input")
+        if ref_audios and audio_vae is None:
+            raise ValueError("encoding reference audios needs the audio_vae input")
+        new_pairs = []
+        # socket order = label order: sort by the numeric suffix explicitly
+        # instead of trusting dict iteration order
+        for name in sorted(ref_images,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            new_pairs.append(_encode_ref_image_pair(
+                vae, ref_images[name], ref_image_size, width, height))
+        for name in sorted(ref_audios,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            new_pairs.append(_encode_ref_audio_pair(audio_vae, ref_audios[name]))
+        return io.NodeOutput(
+            _attach_scene_refs(clip, conditioning, scene_index, new_pairs))
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +1758,7 @@ NODE_CLASS_MAPPINGS = {
     "CLSSH3Config":           CLSSH3Config,
     "CLSSH3ScenePrompts":     CLSSH3ScenePrompts,
     "CLSSH3SceneReference":   CLSSH3SceneReference,
+    "CLSSH3SceneReferences":  CLSSH3SceneReferences,
     "CLSSH3StreamingSampler": CLSSH3StreamingSampler,
     "CLSSH3Guider":           CLSSH3Guider,
     "CLSSH3VideoDecodeSave":  CLSSH3VideoDecodeSave,
@@ -1682,6 +1767,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3Config":           "CLSS H3 Config",
     "CLSSH3ScenePrompts":     "CLSS H3 Scene Prompts",
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",
+    "CLSSH3SceneReferences":  "CLSS H3 Scene References (R2V multi)",
     "CLSSH3StreamingSampler": "CLSS H3 Streaming Sampler",
     "CLSSH3Guider":           "CLSS H3 Guider (Split AV CFG)",
     "CLSSH3VideoDecodeSave":  "CLSS H3 Video Decode+Save (streaming)",

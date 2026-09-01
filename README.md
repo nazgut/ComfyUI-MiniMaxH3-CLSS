@@ -15,6 +15,7 @@ CLSS treats the chunk hand-off as a **feedback loop** and controls it. Chunks sh
 - **Audio seam guide** — the last N seconds of the previous chunk's audio are pinned as a `cond_audio` guide keyframe whose window **ends exactly at the join and reaches backward** (fractional/negative anchor index). This end-aligned placement is the measured mechanism that takes seam correlation from 0.45 to 0.95+; a forward/overlap-aligned guide makes the model loop the motif instead. The guide is the *only* audio context — overlap rows are fresh noise and the join is a plain cut
 - **Split video/audio CFG with continuation-chunk falloff** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale. On continuation chunks `audio_cfg_cont` drops audio CFG (default 1.0 = off): the SLB overlap cancels out of the CFG direction, so high audio CFG at a join just amplifies the re-applied text prompt and opens a new musical section every chunk
 - **Optional i2v first-frame guide** — an image input is VAE-encoded and pinned as a `minimax_keyframes` row at frame 0 of chunk 0 (H3-native first-frame conditioning)
+- **Per-scene R2V references** — H3's ref2va mechanism split by scene: reference images/audios bind to `<Picture N>` / `<Audio N>` labels in one scene's prompt and ride only that scene's chunks
 
 ## Multi-scene prompts
 
@@ -29,6 +30,12 @@ structured six-section format: `subject_definitions:` / `summary:` /
 block must carry the full structure (a chunk window only ever sees its own scene's
 text); keep each block under ~400 words. The canonical workflow's 3-scene Ferrari
 prompt is written in this format — copy its shape.
+
+## R2V references (per-scene image/audio anchors)
+
+`CLSSH3SceneReference` / `CLSSH3SceneReferences` attach reference media to **one scene's** conditioning (chain one node per scene; refs never leak across scenes). The scene text is re-tokenized with the reference presentation, so labels bind at tokenize time — reference them in the prompt as `<Picture 1..N>` for images and `<Audio 1..M>` for audios, in socket order. This is H3's native ref2va mechanism made per-scene: identity/style anchors follow their scene's chunks only.
+
+The multi-ref node uses V3 Autogrow sockets (up to 9 images + 3 audios per scene); the single-ref node stacks one image and/or one audio per node. `ref_image_size=match` (default) downscales refs to the generation's pixel area — `max` keeps more identity detail but ref tokens ride **every** chunk of the scene and can be several times slower. See [`workflow/t2v_with_ref_minimaxh3_clss.json`](workflow/t2v_with_ref_minimaxh3_clss.json) for the full chain.
 
 ## Model files
 
@@ -54,7 +61,10 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/nazgut/ComfyUI-MiniMaxH3-CLSS.git
 ```
 
-Restart ComfyUI — no pip install step, no submodules. Load [`workflow/t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json). The canonical workflow is the live-validated 16 GB reference config: 832×480, 243 px ≈ 10 s chunk windows, 10 chunks ≈ 100 s total, 20 steps, sigma shift 12/6.
+Restart ComfyUI — no pip install step, no submodules. Two workflows ship in `workflow/`:
+
+- [`t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json) — canonical t2v, the live-validated 16 GB reference config: 832×480, 243 px ≈ 10 s chunk windows, 10 chunks ≈ 100 s total, 20 steps, sigma shift 12/6.
+- [`t2v_with_ref_minimaxh3_clss.json`](workflow/t2v_with_ref_minimaxh3_clss.json) — R2V variant: 3 scenes × 1 chunk at 640×320, each scene anchored by a `CLSSH3SceneReferences` chain (3 identity images per scene).
 
 ## Nodes
 
@@ -62,14 +72,16 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 
 | Node | Purpose |
 |---|---|
-| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid, noise temporal correlation) |
-| **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING |
+| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid) |
+| **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING; stashes raw scene text for the ref nodes |
+| **CLSS H3 Scene Reference (R2V)** | Attach one reference image and/or audio to one scene's conditioning (`<Picture N>` / `<Audio N>` labels) |
+| **CLSS H3 Scene References (R2V multi)** | All of one scene's refs in one node — V3 Autogrow sockets, up to 9 images + 3 audios, socket order = label order |
 | **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
 ```
-UNETLoader → CLSSH3Guider ← CLSSH3ScenePrompts(+) / CLSSH3ScenePrompts(−)
+UNETLoader → CLSSH3Guider ← CLSSH3ScenePrompts(+) [→ CLSSH3SceneReference(s) per scene] / CLSSH3ScenePrompts(−)
 EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelect, BasicScheduler, RandomNoise)
 → CLSSH3VideoDecodeSave → PNG frames + AUDIO
 ```
@@ -77,9 +89,9 @@ EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelec
 ## Repository layout
 
 ```
-nodes.py     # all 5 ComfyUI node implementations
+nodes.py     # all 7 ComfyUI node implementations
 clss.py      # the model-agnostic CLSS algorithm core (SLB, EMA/AdaIN, anchor bank)
-workflow/    # canonical t2v workflow — copy it for experiments, don't mutate in place
+workflow/    # canonical t2v + R2V workflows — copy them for experiments, don't mutate in place
 ```
 
 ## Status

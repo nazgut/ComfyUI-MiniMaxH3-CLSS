@@ -64,12 +64,16 @@ weights**:
 ## Repository layout
 
 ```
-nodes.py     # all 5 ComfyUI node implementations
+nodes.py     # all 7 ComfyUI node implementations (incl. R2V scene-reference nodes:
+             # CLSSH3SceneReference single + CLSSH3SceneReferences V3-Autogrow multi,
+             # re-tokenizing one scene's text with minimax_ref_items so <Picture N>/
+             # <Audio N> labels bind per scene)
 clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, §2.3 EMA/AdaIN,
              # §2.5 anchor bank, post_process, reset_drift_refs) — no ltx imports
 __init__.py  # node-mapping exports only
-workflow/    # canonical workflow: t2v_minimaxh3_clss.json (API format).
-             # RULE: every experiment copies the canonical file — never mutate it in place.
+workflow/    # canonical workflows: t2v_minimaxh3_clss.json + t2v_with_ref_minimaxh3_clss.json
+             # (API format). RULE: every experiment copies the canonical file — never
+             # mutate it in place.
 ```
 
 ### Relationship to the LTX repo
