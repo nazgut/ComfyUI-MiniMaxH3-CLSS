@@ -1,62 +1,11 @@
-"""ComfyUI nodes for CLSS (Closed-Loop Streaming Synthesis) on MiniMax H3.
-
-Port of the LTX-2 CLSS node layer (ComfyUI-LTX2.3-CLSS) to the MiniMax H3
-packed audio-video DiT.  The model-agnostic algorithm core (CLSSConfig /
-CLSSState: SLB bookkeeping, §2.3 EMA-AdaIN drift correction) lives in the
-vendored `clss.py`; this file is the H3-specific orchestration.
-
-Key mechanism differences from the LTX version:
-
-- Latent: one dict {"samples": NestedTensor((video [B,24,T,H/16,W/16],
-  audio [B,32,2,Ta]))}.  Video grid: px frames snap to 17k+5 ⇔ latent tokens
-  5k+2 (`video_latent_t`); token k covers FRAME_PER_TOKEN[k%5] = (1,4,4,4,4)
-  px frames.  Audio: Ta = round(px × 5/3) at 24 fps (40 latent fps) — the same
-  math as `temporal_shape` in comfy_extras/nodes_minimax_h3.py.
-- §2.1 SLB overlap (video only): the previous chunk's corrected tail is
-  written INTO the chunk's initial latent (video tokens [0:F_ol]) and a
-  per-stream denoise mask rides in the latent dict ("noise_mask",
-  NestedTensor).  H3 turns mask value m into a per-row sigma = m·σ
-  (model.py:587-609) and re-blends preserved rows toward the cond-strength
-  injection every step (model_base.py:2248-2272 scale_latent_inpaint, called
-  from KSamplerX0Inpaint in comfy/samplers.py:634-643).
-- Audio seam (H3-Motion-Context's recipe): the audio overlap rows carry NO
-  previous-tail content — they are 100% fresh noise under an all-ones mask
-  (measured on H3: masked-in audio rows are treated as output, not context).
-  The only audio context is the previous tail pinned as a cond_audio guide
-  keyframe whose window ENDS at the join (fractional/negative
-  resolved_frame_index), and the rendered overlap is trimmed with a plain
-  cut (no crossfade).
-- The i2v guide image rides as a `minimax_keyframes` conditioning row
-  ({"resolved_frame_index", "latent"}) — the H3-native pinning mechanism
-  (model.py:340-361, pinned near-clean, re-injected every step).
-- R2V references (stock ref2va contract): CLSSH3SceneReference attaches
-  `minimax_refs` blocks (image/audio latents) to ONE scene's conditioning and
-  re-tokenizes the scene text with the reference presentation so <Picture N> /
-  <Audio N> labels bind.  Refs ride every chunk of their scene — PackedLayout
-  packs them ahead of the target timeline and shifts the keyframe anchors by
-  their span (model_base.py:2188-2211, model.py:334-361), so the end-aligned
-  audio guide keyframe keeps resolving relative to the target origin.
-  Scenes without a ref node stay reference-free.
-- No hard RoPE wall on H3 (no max_pos); the trained range is ~124-362 px
-  frames (~5-15 s, per the EmptyMiniMaxH3LatentAV tooltip).  The LTX
-  RoPE-wall auto-split is kept in shape with _WINDOW_CAP_S = 12.0.
-- Split video/audio CFG lives in CLSSH3Guider (a CFGGuider subclass doing
-  unpack → per-stream CFG → rescale → repack).  No STG, no modality_scale, no
-  per-modality sigma logic — H3's ModelSamplingAV owns the audio schedule and
-  the shift knobs live on the stock MiniMaxH3SigmaShift node.
-"""
-
 from __future__ import annotations
 
 import copy
 import dataclasses
 import math
 import os
+import time
 
-# Long chunked runs alloc/free large transient tensors every chunk; without
-# expandable_segments the CUDA caching allocator fragments and a 6-chunk run
-# OOMs on a 16 GB card with GiBs still reserved-but-unusable (measured:
-# 12.4 GiB allocated, 1.1 GiB request failed, 11 MiB free).
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -73,78 +22,37 @@ from comfy_extras.nodes_minimax_h3 import AUDIO_LATENT_FPS, FPS as _NATIVE_FPS
 
 try:
     from .clss import CLSSConfig, CLSSState
-except ImportError:  # direct `import nodes` (smoke tests, scripts)
+except ImportError:
     from clss import CLSSConfig, CLSSState
 
 
-# ---------------------------------------------------------------------------
-# §-constants carried over from the LTX port (validated there, revalidated on
-# H3 only by live run — see AGENTS.md conventions).
-# ---------------------------------------------------------------------------
-
-# §2.1 per-chunk tau_c schedule rises from the configured base toward this
-# ceiling with a 5-chunk half-life (late chunks drift more, get more repair).
 _VIDEO_TAU_C_CEILING = 0.10
 
-# H3 has no hard RoPE wall, but the model is trained on ~124-362 px frames
-# (~5-15 s at 24 fps).  Keep each sampling window (overlap + new) at or under
-# this many seconds; longer chunks are auto-split into uniform sub-chunks.
 _WINDOW_CAP_S = 12.0
 
-# Minimum SLB overlap in latent tokens on the 5k+2 grid (2 tokens = 5 px ≈
-# 0.21 s).  Overlaps are always 5m+2 tokens so that window token phases line
-# up with the absolute decode grid (see _px_of_tokens).
 _MIN_OVERLAP_TOKENS = 2
 
 _SCENE_BLEND_W = 0.5
 
-# ref_image_size="max": 2048 px short edge (stock ref2va's high-fidelity mode;
-# "match" downscales to the generation's pixel area instead).
 _REF_IMAGE_SHORT_EDGE = 2048
 
-
-# ---------------------------------------------------------------------------
-# Small grid helpers — H3's latent↔pixel↔audio time mapping.
-# ---------------------------------------------------------------------------
+_NOISE_FIELD_CAP_TOK = 40000
+_NOISE_FIELD_CAP_AF = 220000
 
 
 def _px_of_tokens(n_tokens: int, start_phase: int = 0) -> int:
-    """Exact px-frame span of n_tokens consecutive video latent tokens.
-
-    Token k covers FRAME_PER_TOKEN[k % 5] = (1,4,4,4,4) px frames; the phase
-    is the token's index mod 5 in its home sequence (window for conditioning,
-    absolute video for decode).  Phase matters: 7 tokens span 22 px at phase 0
-    but 25 px at phase 2.
-    """
     return sum(FRAME_PER_TOKEN[(start_phase + j) % 5] for j in range(n_tokens))
 
 
 def _af_of_px(px: int) -> int:
-    """Audio latent frames covering px pixel frames (temporal_shape math;
-    FRAME_RESCALE = 5/3 = AUDIO_LATENT_FPS / 24 exactly)."""
     return round(px * FRAME_RESCALE)
 
 
 def _snap_overlap(overlap: int) -> int:
-    """Snap the SLB size to the 5m+2 token grid.
-
-    Chunk 0 contributes 5k+2 tokens and every continuation chunk a multiple of
-    5, so every chunk starts at absolute token phase 2; an overlap of 5m+2
-    tokens then starts at phase (2 − (5m+2)) % 5 = 0, which makes the overlap's
-    window-relative token spans equal its absolute spans and keeps the audio
-    overlap length exact.
-    """
     return max(_MIN_OVERLAP_TOKENS, 5 * round((overlap - 2) / 5) + 2)
 
 
 def _split_run(n_tokens: int, max_new: int, plus2: bool) -> list[int]:
-    """Split a chunk's new-token run into grid-aligned parts ≤ max_new.
-
-    n_tokens is 5k+2 (plus2=True, the run starting at absolute phase 0 — i.e.
-    chunk 0) or 5k (plus2=False).  The first part keeps the +2 so downstream
-    parts stay multiples of 5 and every part's start phase stays on the
-    absolute grid.
-    """
     plus = 2 if plus2 else 0
     groups = (n_tokens - plus) // 5
     cap = max(1, (max_new - plus) // 5)
@@ -154,32 +62,7 @@ def _split_run(n_tokens: int, max_new: int, plus2: bool) -> list[int]:
     return [5 * gs[0] + plus] + [5 * g for g in gs[1:]]
 
 
-# ---------------------------------------------------------------------------
-# Scene crossfade (ported as-is from the LTX node layer, plus token-tag
-# alignment for the qwen3vl conditioning).
-# ---------------------------------------------------------------------------
-
-
 def _blend_scene_cond(prev: dict, new: dict, w: float = _SCENE_BLEND_W) -> dict:
-    """Weighted cross-attn embedding blend for scene-transition chunks.
-
-    The scene hand-off swaps the whole window's text conditioning at a chunk
-    boundary, which reads as a hard cut: the frozen SLB overlap is the only
-    visual bridge, and every new frame is denoised under the incoming scene
-    alone at full CFG.  Blending the outgoing scene's embedding into the
-    boundary chunks (25%-incoming on the outgoing block's last chunk,
-    75%-incoming on the incoming block's first) lets the tail action finish
-    on screen while the new scene's content takes over.  Scenes tokenize to
-    different lengths, so the shorter sequence is edge-padded (EOS-repeat)
-    before blending; structurally incompatible entries fall back to the new
-    scene unblended.  ``w`` is the incoming-scene weight.
-
-    H3 addition: `minimax_token_tags` (per-token modality tags consumed as tag
-    runs in model.py:624-634) must cover the padded length too — they are
-    edge-padded in lockstep with cross_attn; if the two scenes' tags can't be
-    aligned (different width or missing), the blended entry falls back to the
-    incoming scene's tags, which match its (padded) embedding by construction.
-    """
     pe, ne = prev.get("cross_attn"), new.get("cross_attn")
     if pe is None or ne is None or pe.shape[-1] != ne.shape[-1]:
         return new
@@ -203,15 +86,7 @@ def _blend_scene_cond(prev: dict, new: dict, w: float = _SCENE_BLEND_W) -> dict:
             blended["minimax_token_tags"] = nt.reshape(new["minimax_token_tags"].shape[:-1] + (t,)) \
                 if new["minimax_token_tags"].ndim > 1 else nt
         else:
-            # tags disagree between scenes (e.g. one has vision tokens): the
-            # blend is only meaningful over the shared text span then — keep
-            # the incoming scene's tags, padded to the blend length.
             blended["minimax_token_tags"] = nt
-    # R2V refs follow the scene the blend leans toward (w >= 0.5 → incoming):
-    # a mostly-outgoing transition chunk keeps the outgoing scene's reference
-    # rows on the pack (its content is still on screen), a mostly-incoming one
-    # takes the incoming scene's.  Without this, dict(new) would hand the
-    # outgoing-leaning 25% chunk the incoming scene's refs.
     _ref_src = new if w >= 0.5 else prev
     if _ref_src.get("minimax_refs") is not None:
         blended["minimax_refs"] = _ref_src["minimax_refs"]
@@ -220,16 +95,7 @@ def _blend_scene_cond(prev: dict, new: dict, w: float = _SCENE_BLEND_W) -> dict:
     return blended
 
 
-# ---------------------------------------------------------------------------
-# Telemetry helpers (structure metrics only — they localize failures, they
-# never prove a quality win; the user's eyes/ears on a live decode are the
-# only ground truth).  Audio latents are [B, 32, 2, Ta] here — the time axis
-# is LAST (the LTX port had [B, C, T, freq]).
-# ---------------------------------------------------------------------------
-
-
 def _frame_cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Cosine similarity between two video frames ([B, C, H, W] each)."""
     with torch.no_grad():
         fa = F.normalize(a.float().reshape(a.shape[0], a.shape[1], -1).mean(-1), dim=1)
         fb = F.normalize(b.float().reshape(b.shape[0], b.shape[1], -1).mean(-1), dim=1)
@@ -244,28 +110,12 @@ def _aud_cos(a: torch.Tensor, b: torch.Tensor) -> float:
         return (fa * fb).sum(dim=1).mean().item()
 
 
-# ---------------------------------------------------------------------------
-# Delivered-domain seam telemetry (patch #10).  aud_bnd/aud_dlv are
-# single-frame latent cosines — a 40 Hz audio latent frame is 25 ms and NOT
-# frame-to-frame redundant, so they cannot see clicks, phase offsets, or
-# loops.  These four measure what the listener actually receives, on the
-# post-crossfade delivered audio.  Read-only: they never touch the tensors.
-# ---------------------------------------------------------------------------
-# Loop detection searches ALL shifts via FFT — window-cosine approaches miss
-# repeats that don't align to the window grid even when the repeat is
-# bit-exact (verified in the harness: 1-frame offset -> cosine collapses).
-
-
 def _aud_flat(t: torch.Tensor) -> torch.Tensor:
-    """[B,C,L,T] audio latent -> [B, C*L, T] float32 for telemetry."""
     return t.float().reshape(t.shape[0], -1, t.shape[-1])
 
 
 def _aud_seam_step(prev_tail: torch.Tensor, new_head: torch.Tensor,
                    ctx: int = 40) -> float:
-    """Frame-to-frame jump ACROSS the join divided by the median jump in the
-    ±ctx frames around it.  ~1.0 = the join is as smooth as ordinary content;
-    >>1 = a click/edge exactly at the seam."""
     with torch.no_grad():
         n = min(ctx, prev_tail.shape[-1], new_head.shape[-1])
         if n < 3:
@@ -278,10 +128,6 @@ def _aud_seam_step(prev_tail: torch.Tensor, new_head: torch.Tensor,
 
 def _aud_best_lag(prev_tail: torch.Tensor, new_head: torch.Tensor,
                   win: int = 24, max_lag: int = 6) -> tuple[float, int]:
-    """Best-lag cosine across the seam: last `win` frames before the join vs
-    a lagged window after it.  (high cos, lag 0) = phase-aligned; a nonzero
-    best lag = a residual px<->audio rounding offset (25 ms per frame — the
-    bug family patch #8 fixed; this is the regression alarm for it)."""
     with torch.no_grad():
         pa, na = _aud_flat(prev_tail), _aud_flat(new_head)
         if pa.shape[-1] < win or na.shape[-1] < win + max_lag:
@@ -298,19 +144,13 @@ def _aud_best_lag(prev_tail: torch.Tensor, new_head: torch.Tensor,
 
 def _aud_loop_ncc(history: torch.Tensor, new_chunk: torch.Tensor,
                   ) -> tuple[float, float]:
-    """Loop-lock detector on DELIVERED audio: normalized cross-correlation of
-    the new chunk against ALL previously delivered audio of the scene,
-    searched over every time shift (FFT convolution).  A chunk that replays
-    earlier material — the loop failure — peaks near 1.0 at the shift where
-    the copy lives; fresh content stays near 0.  Returns (ncc, seconds)."""
     with torch.no_grad():
-        f = _aud_flat(history)[0]      # [D, Th]
-        g = _aud_flat(new_chunk)[0]    # [D, Tn]
+        f = _aud_flat(history)[0]
+        g = _aud_flat(new_chunk)[0]
         Th, Tn = f.shape[-1], g.shape[-1]
         if Th < Tn or Tn < 8:
             return float("nan"), float("nan")
         nfft = 1 << (Th + Tn - 1).bit_length()
-        # cc[k] = sum_d sum_t f_d[t+k] * g_d[t]  ->  new[0] aligned at hist k
         cc = torch.fft.irfft(torch.fft.rfft(f, n=nfft)
                              * torch.fft.rfft(g, n=nfft).conj(),
                              n=nfft)[..., :Th].sum(0)
@@ -322,11 +162,6 @@ def _aud_loop_ncc(history: torch.Tensor, new_chunk: torch.Tensor,
 
 
 def _aud_within_chunk_sims(new_aud: torch.Tensor, n_seg: int = 3) -> list[float]:
-    """Cosine sims between consecutive thirds of a chunk's new audio.
-
-    Detects the chunked-audio "metronome" fixed-point (within-chunk segment
-    repetition reads as rising similarity).
-    """
     T = new_aud.shape[-1]
     if T < n_seg * 2:
         return []
@@ -349,12 +184,6 @@ def _post_process_audio_latent(
     energy_beta: float = 0.0,
     label: str = "",
 ) -> torch.Tensor:
-    """Cross-chunk audio hygiene on the concatenated [B, 32, 2, Ta] latent.
-
-    energy_beta > 0 soft-matches each chunk's RMS toward the median chunk
-    (disabled at the call site — kept for experiments).  The always-on part
-    smooths a few frames across each chunk boundary to hide seam clicks.
-    """
     if not chunk_ends:
         return audio_lat
     audio_lat = audio_lat.clone()
@@ -395,48 +224,133 @@ def _post_process_audio_latent(
 
 
 def _tau_c_eff(base: float, ceiling: float, chunk_idx: int, half_life: float = 5.0) -> float:
-    """§2.1 schedule: rise from base toward ceiling with a 5-chunk half-life."""
     if base <= 0.0:
         return 0.0
     decay = 0.5 ** (chunk_idx / half_life)
     return ceiling - (ceiling - base) * decay
 
 
-_GUIDE_LAYOUT_CHECKED = False
+_MC_AUDIO_KEY = "motion_context_audio_end_frame"
+
+_MC_PATCHED = False
+_MC_FAILED = None
 
 
-def _check_guide_layout() -> None:
-    """The end-aligned audio guide needs a fractional, NEGATIVE
-    resolved_frame_index to be taken literally by PackedLayout
-    (cond_t = cursor + FRAME_RESCALE * index).  ComfyUI < 0.34's layout
-    (constructor still takes frame_count) rejected any keyframe anchor
-    other than the first/last frame, so on it the guide would land at the
-    wrong instant or fail deep inside the model.  Fail loudly with the
-    fix instead (the H3-Motion-Context pack's layout_contract does the
-    full behavioural proof; the signature check covers the one breaking
-    upstream change known to matter here)."""
-    global _GUIDE_LAYOUT_CHECKED
-    if _GUIDE_LAYOUT_CHECKED:
-        return
-    import inspect
-    from comfy.ldm.minimax.model import PackedLayout
-    try:
-        params = inspect.signature(PackedLayout.__init__).parameters
-    except (TypeError, ValueError):
-        params = {}
-    if "frame_count" in params:
+def _mc_target_origin(layout) -> float:
+    if not layout.segments:
+        raise RuntimeError("PackedLayout has no segments")
+    a, b, kind = layout.segments[-1]
+    if kind != "video" or b <= a:
+        raise RuntimeError("PackedLayout target video is not the final segment")
+    return float(layout.position_ids[a, 0])
+
+
+def _mc_ref_map(layout, refs):
+    def emitted(block):
+        kind = block.get("kind")
+        rt = int(block.get("ref_audio_t", 0))
+        if kind == "image":
+            return ("ref_img",)
+        if kind == "audio":
+            return ("ref_audio",) if rt > 0 else ()
+        if kind in ("video", "video_audio"):
+            return (("ref_audio",) if rt > 0 else ()) + ("ref_img",)
+        raise RuntimeError("unknown MiniMax H3 reference kind %r" % (kind,))
+
+    actual = [(a, b, k) for a, b, k in layout.segments
+              if k in ("ref_img", "ref_audio")]
+    expected = [(i, k) for i, ref in enumerate(refs or [])
+                for k in emitted(ref)]
+    if len(actual) != len(expected):
+        raise RuntimeError("MiniMax H3 reference layout segment count changed")
+    out = {}
+    for (index, wanted), (a, b, got) in zip(expected, actual):
+        if wanted != got:
+            raise RuntimeError("MiniMax H3 reference layout order changed")
+        out.setdefault(index, {})[wanted] = (a, b)
+    return out
+
+
+def _mc_fixup_audio(layout, refs) -> None:
+    marked = [i for i, r in enumerate(refs or [])
+              if r.get(_MC_AUDIO_KEY) is not None]
+    if len(marked) != 1:
+        raise RuntimeError("expected exactly one marked Motion Audio Context ref")
+    index = marked[0]
+    ref = refs[index]
+    if ref.get("kind") != "audio":
+        raise RuntimeError("Motion Audio Context marker must be on an audio ref")
+    steps = int(ref.get("ref_audio_t", 0))
+    segment = _mc_ref_map(layout, refs).get(index, {}).get("ref_audio")
+    if steps <= 0 or segment is None:
+        raise RuntimeError("Motion Audio Context emitted no audio rows")
+    a, b = segment
+    if b - a != steps * 2:
+        raise RuntimeError("Motion Audio Context row count changed")
+    span_px = float(ref[_MC_AUDIO_KEY])
+    if span_px < 0 or span_px > 1e6:
         raise RuntimeError(
-            "[CLSS] audio_guide_seconds > 0 needs ComfyUI 0.34.0 or newer: "
-            "this ComfyUI's PackedLayout still takes frame_count and only "
-            "accepts first/last-frame keyframe anchors, so the guide's "
-            "fractional negative index would not be honoured. Update "
-            "ComfyUI, or set audio_guide_seconds to 0.")
-    _GUIDE_LAYOUT_CHECKED = True
+            f"Motion Audio Context span out of range: {span_px} px")
+    desired = (_mc_target_origin(layout)
+               + FRAME_RESCALE * span_px - steps)
+    current = float(layout.position_ids[a, 0])
+    new_end = desired + steps
+    origin = _mc_target_origin(layout)
+    if new_end > origin + FRAME_RESCALE * span_px + 1e-6:
+        raise RuntimeError(
+            f"Motion Audio Context block would end past its span "
+            f"(end {new_end:.3f} > {origin + FRAME_RESCALE * span_px:.3f})")
+    layout.position_ids[a:b, 0] += desired - current
 
 
-# ---------------------------------------------------------------------------
-# Nodes
-# ---------------------------------------------------------------------------
+def _mc_apply_patch() -> bool:
+    global _MC_PATCHED, _MC_FAILED
+    if _MC_PATCHED:
+        return True
+    if _MC_FAILED is not None:
+        return False
+    import inspect
+    from comfy.ldm.minimax import model as mm
+    for name in ("PackedLayout", "FRAME_RESCALE", "FRAME_PER_TOKEN"):
+        if not hasattr(mm, name):
+            _MC_FAILED = "MiniMax H3 model module is missing %s" % name
+            return False
+    orig_init = mm.PackedLayout.__init__
+    try:
+        _has_fc = "frame_count" in inspect.signature(orig_init).parameters
+    except (TypeError, ValueError):
+        _has_fc = False
+
+    def patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                     keyframes=None, refs=None, frame_count=None):
+        if _has_fc:
+            orig_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                      keyframes=keyframes, refs=refs, frame_count=frame_count)
+        else:
+            orig_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                      keyframes=keyframes, refs=refs)
+        if refs and any(r.get(_MC_AUDIO_KEY) is not None for r in refs):
+            _mc_fixup_audio(self, refs)
+
+    try:
+        probe = mm.PackedLayout.__new__(mm.PackedLayout)
+        patched_init(probe, 7, 7, 22, 38, 16,
+                     refs=[{"kind": "audio", "ref_audio_t": 8,
+                            _MC_AUDIO_KEY: 4.0}])
+        a, b = _mc_ref_map(probe, [{"kind": "audio", "ref_audio_t": 8}])[0]["ref_audio"]
+        wanted = (_mc_target_origin(probe) + mm.FRAME_RESCALE * 4.0 - 8.0)
+        if b - a != 16 or abs(float(probe.position_ids[a, 0]) - wanted) > 1e-6:
+            raise RuntimeError("Motion Audio Context self-test position mismatch")
+    except Exception as exc:
+        _MC_FAILED = str(exc)
+        print(f"[CLSS] WARNING: Motion Context layout patch self-test failed "
+              f"({exc!r}); audio continuity falls back to the unpositioned "
+              f"ref block.")
+        return False
+
+    mm.PackedLayout.__init__ = patched_init
+    _MC_PATCHED = True
+    return True
 
 
 class CLSSH3Config:
@@ -461,8 +375,6 @@ class CLSSH3Config:
     CATEGORY = "MiniMaxH3-CLSS"
 
     def build(self, tau_c, beta, overlap):
-        # Validated-production values carried over from the LTX node layer;
-        # the dataclass defaults in clss.py are the paper's, not ours.
         return (CLSSConfig(
             tau_c=tau_c,
             beta=beta,
@@ -481,8 +393,13 @@ class CLSSH3ScenePrompts:
                 "clip":    ("CLIP",   {"tooltip": "CLIP (qwen3vl-32B) text encoder. Each scene's raw text is encoded as its own CONDITIONING entry — no system prompt / chat template (that was LTX-specific; H3's RoPE t-origin sits after the text span, so a scene's text must stay identical across its chunks, which raw reuse guarantees)."}),
                 "prompts": ("STRING", {"multiline": True, "dynamicPrompts": False,
                                        "default": "Scene 1 description\n---\nScene 2 description",
-                                       "tooltip": "One scene per block, separated by a line containing only '---'. Each scene is encoded as its own CONDITIONING entry (minimax_token_tags preserved); with N entries the sampler assigns one scene per chunk proportionally across num_chunks.",
+                                       "tooltip": "One scene per block, separated by a line containing only '---'. Each scene is encoded as its own CONDITIONING entry (minimax_token_tags preserved); with N entries the sampler assigns one scene per chunk proportionally across num_chunks. The global_text field (if filled) is prepended to every block before encoding.",
                                        }),
+            },
+            "optional": {
+                "global_text": ("STRING", {"multiline": True, "dynamicPrompts": False,
+                                           "default": "",
+                                           "tooltip": "Text copied to the TOP of every scene block before encoding — write shared sections ONCE (style, subject_definitions, overall_soundscape, non_diegetic_music, quality rules) instead of repeating them in each '---' block. Empty = off. The prefix is baked into each scene's text, so it stays byte-identical across that scene's chunks (RoPE position stability) and survives the ref nodes' re-tokenization (clss_scene_text carries the combined text)."}),
             },
         }
     RETURN_TYPES = ("CONDITIONING",)
@@ -490,32 +407,25 @@ class CLSSH3ScenePrompts:
     FUNCTION = "generate"
     CATEGORY = "MiniMaxH3-CLSS"
 
-    def generate(self, clip, prompts: str):
+    def generate(self, clip, prompts: str, global_text: str = ""):
         scenes = [s.strip() for s in prompts.split("\n---\n") if s.strip()]
         if not scenes:
             scenes = [prompts.strip()]
+        prefix = (global_text or "").strip()
+        if prefix:
+            print(f"[CLSS] scene prompts: global text ({len(prefix)} chars) "
+                  f"prepended to all {len(scenes)} scene block(s).")
         flat_conditioning = []
         for scene in scenes:
-            # raw text, no chat template; encode_token_weights attaches
-            # minimax_token_tags to the conditioning entry automatically.
-            encoded = clip.encode_from_tokens_scheduled(clip.tokenize(scene))
+            text = f"{prefix}\n{scene}" if prefix else scene
+            encoded = clip.encode_from_tokens_scheduled(clip.tokenize(text))
             for entry in encoded:
-                # stash the raw scene text so CLSSH3SceneReference can
-                # re-tokenize it with the reference presentation (the
-                # <Picture N>/<Audio N> labels bind at tokenize time).
-                entry[1]["clss_scene_text"] = scene
+                entry[1]["clss_scene_text"] = text
             flat_conditioning.extend(encoded)
         return (flat_conditioning,)
 
 
-# ---------------------------------------------------------------------------
-# R2V references (stock ref2va contract, per-scene)
-# ---------------------------------------------------------------------------
-
-
 def _encode_ref_image_pair(vae, image, ref_image_size, width, height):
-    """Stock ref2va image encode: downscale-only sizing, canvas multiple 32.
-    Returns (tokenizer item, minimax_refs block)."""
     h, w = image.shape[1], image.shape[2]
     if ref_image_size == "match":
         scale = min(1.0, math.sqrt((width * height) / (w * h)))
@@ -532,29 +442,91 @@ def _encode_ref_image_pair(vae, image, ref_image_size, width, height):
              "latent": z})
 
 
-def _encode_ref_audio_pair(audio_vae, audio):
-    """Stock _encode_ref_audio: resample to the VAE's rate, encode batch 1 as
-    [1, L, C]; ref_audio_t = latent frames (40 Hz)."""
+def _ref_audio_waveform(audio_vae, audio):
+    # AUDIO -> [1, 2, N] at the audio-VAE rate. Mono is upmixed to the stereo
+    # lanes the VAE latent carries; >2 channels are truncated (the ref2va
+    # presentation is stereo, matching the [B,32,2,Ta] target audio).
     waveform = audio["waveform"]
     sr = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr != vae_sr:
         import torchaudio
         waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
-    z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
+    waveform = waveform[:1]
+    if waveform.shape[1] == 1:
+        waveform = waveform.expand(-1, 2, -1)
+    elif waveform.shape[1] > 2:
+        waveform = waveform[:, :2]
+    return waveform.contiguous(), vae_sr
+
+
+def _encode_ref_audio_slice(audio_vae, waveform):
+    # one [1, 2, N] waveform segment -> (tokenizer item, ref block). Encoding a
+    # SLICE standalone (rather than cutting the full latent) keeps every segment
+    # on the VAE's own latent grid, so slice boundaries are exact.
+    z = audio_vae.encode(waveform.movedim(1, -1))
     return ({"type": "audio"},
             {"kind": "audio", "ref_audio_t": z.shape[-1], "audio_latent": z})
 
 
-def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
-    """Merge new (item, block) pairs into ONE scene's conditioning entry and
-    re-tokenize the scene text with the full reference presentation.
+def _encode_ref_audio_pair(audio_vae, audio):
+    waveform, _ = _ref_audio_waveform(audio_vae, audio)
+    return _encode_ref_audio_slice(audio_vae, waveform)
 
-    Refs accumulate with any already on the scene and are presented in the
-    stock order (images first, then audios), so <Picture N>/<Audio N> labels
-    follow each type's input order regardless of wiring order.  Scenes without
-    refs stay reference-free — refs on scene 2 never leak into scene 1.
-    """
+
+def _ref_audio_window_bounds(total_samples: int, window_samples: int,
+                             count: int) -> list[tuple[int, int]]:
+    # Sequential, non-overlapping windows: scene i gets samples
+    # [i*window, (i+1)*window) — "10 s after 10 s" across the scene list.
+    # Windows past the end of the track come back empty (start == end), so the
+    # caller can stop cleanly. Pure math on purpose: unit-checkable without a
+    # VAE.
+    out: list[tuple[int, int]] = []
+    for i in range(count):
+        start = min(i * window_samples, total_samples)
+        end = min(start + window_samples, total_samples)
+        out.append((start, end))
+    return out
+
+
+def _build_audio_ref_block(audio_tail: torch.Tensor, audio_vae=None,
+                           device=None, span_px: float = 0.0,
+                           level_ref: float | None = None,
+                           refresh: bool = False) -> dict | None:
+    if audio_tail is None or audio_tail.shape[-1] <= 0 or span_px <= 0:
+        return None
+    wanted = int(round(span_px / float(_NATIVE_FPS) * AUDIO_LATENT_FPS))
+    if wanted <= 0:
+        return None
+    z = audio_tail[..., -wanted:] if audio_tail.shape[-1] > wanted else audio_tail
+    if audio_vae is not None and refresh:
+        try:
+            z_in = z.to(device) if device is not None else z
+            wav = audio_vae.decode(z_in)
+            if wav.ndim == 3:
+                wav = wav.movedim(-1, 1)
+            z = audio_vae.encode(wav[:1].movedim(1, -1))
+        except Exception as exc:
+            print(f"[CLSS] WARNING: audio-ref waveform refresh failed "
+                  f"({exc!r}); falling back to the delivered latent.")
+            z = audio_tail[..., -wanted:] if audio_tail.shape[-1] > wanted else audio_tail
+    if z.ndim != 4 or z.shape[-1] <= 0:
+        return None
+    if level_ref is not None and level_ref > 1e-12:
+        _cur = float(z.float().pow(2).mean().sqrt().item())
+        if _cur > 1e-12:
+            _g = float(level_ref) / _cur
+            _g = max(0.25, min(4.0, _g))
+            if abs(_g - 1.0) > 0.01:
+                z = (z.float() * _g).to(z.dtype)
+    blk = {"kind": "audio", "ref_audio_t": int(z.shape[-1]),
+           "audio_latent": z}
+    if _mc_apply_patch():
+        blk[_MC_AUDIO_KEY] = float(span_px)
+    return blk
+
+
+def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
     if not new_pairs:
         raise ValueError("connect at least one image and/or audio reference")
     idx = scene_index - 1
@@ -591,26 +563,16 @@ def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
     out[idx] = [nt, nd]
     ni = sum(1 for b in blocks if b["kind"] == "image")
     na = sum(1 for b in blocks if b["kind"] == "audio")
+    _labels = ([f"<Picture 1..{ni}>"] if ni else []) + \
+              ([f"<Audio 1..{na}>"] if na else [])
     print(f"[CLSS] scene {scene_index}: R2V refs = {ni} image(s) + "
-          f"{na} audio(s) — prompt labels <Picture 1..{ni}> / "
-          f"<Audio 1..{na}>; scene re-tokenized with the ref presentation. "
+          f"{na} audio(s) — prompt labels {' / '.join(_labels) or 'none'}; "
+          f"scene re-tokenized with the ref presentation. "
           f"Ref tokens ride every chunk of scene {scene_index}.")
     return out
 
 
 class CLSSH3SceneReference:
-    """Attach R2V references (image and/or audio) to ONE scene's conditioning.
-
-    Chain several nodes to give a scene several references; refs accumulate
-    per scene and are re-presented to the tokenizer in stock order (images
-    first, then audios), so prompt labels follow each type's chain order:
-    <Picture 1..N> for images, <Audio 1..M> for audios.  Scenes without a ref
-    node stay reference-free — refs on scene 2 never leak into scene 1.
-
-    The scene text is re-tokenized with `minimax_ref_items` (the labels bind
-    at tokenize time), which is why this only works on conditioning from
-    CLSSH3ScenePrompts — it stashes the raw scene text.
-    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -657,13 +619,6 @@ class CLSSH3SceneReference:
 
 
 class CLSSH3SceneReferences(io.ComfyNode):
-    """Multi-ref version: ALL of one scene's reference images/audios in a
-    single node (V3 Autogrow sockets, like the stock MiniMaxH3ReferenceToVideo).
-
-    ref_image_1..N bind to <Picture 1..N>, ref_audio_1..M to <Audio 1..M> —
-    socket order IS the label order.  Chain after CLSSH3SceneReference nodes
-    if you must mix; refs accumulate per scene (images first, then audios).
-    """
 
     @classmethod
     def define_schema(cls):
@@ -711,8 +666,6 @@ class CLSSH3SceneReferences(io.ComfyNode):
         if ref_audios and audio_vae is None:
             raise ValueError("encoding reference audios needs the audio_vae input")
         new_pairs = []
-        # socket order = label order: sort by the numeric suffix explicitly
-        # instead of trusting dict iteration order
         for name in sorted(ref_images,
                            key=lambda n: int(n.rsplit("_", 1)[-1])):
             new_pairs.append(_encode_ref_image_pair(
@@ -724,28 +677,125 @@ class CLSSH3SceneReferences(io.ComfyNode):
             _attach_scene_refs(clip, conditioning, scene_index, new_pairs))
 
 
-# ---------------------------------------------------------------------------
-# Split-CFG guider: unpack the packed AV output, CFG per stream, repack.
-# ---------------------------------------------------------------------------
+class CLSSH3SceneReferencesAll(io.ComfyNode):
+    """R2V refs for the whole scene list in one node.
+
+    Images attach to EVERY scene; the reference audio is cut into sequential
+    per-scene windows ("10 s after 10 s"), so there is no per-scene node chain
+    to maintain when the prompt list changes.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CLSSH3SceneReferencesAll",
+            display_name="CLSS H3 Scene References (R2V all scenes)",
+            category="MiniMaxH3-CLSS",
+            description="All-scene R2V refs in one node: every ref_image attaches to ALL scenes ('---' blocks), and the ref audio is cut into one window per scene — scene i anchors on seconds [i*T, (i+1)*T) of the (concatenated) track, T = audio_seconds_per_scene. Replaces chaining one CLSSH3SceneReferences per scene.",
+            inputs=[
+                io.Conditioning.Input("conditioning", tooltip="Per-scene CONDITIONING from CLSSH3ScenePrompts — one entry per '---' block. Every scene is re-tokenized with its own reference presentation, so refs bind per scene and never leak across scenes."),
+                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B / ClipProj). Each scene's raw text is re-tokenized with that scene's <Picture N>/<Audio N> presentation; the text itself stays byte-identical."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when any ref_image is connected. Images are encoded ONCE and the same latent is shared by every scene's block (the DiT reads ref blocks read-only)."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio is connected. Connected files are resampled to the VAE rate, concatenated in socket order, then windowed per scene."),
+                io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
+                    tooltip="Reference image sizing (stock ref2va rule), applied to every scene's copy. match: aspect-preserving downscale (never upscale) to the generation's pixel area — set width/height to your EmptyMiniMaxH3LatentAV size. max: 2048 px short edge, best identity fidelity — but ref tokens ride EVERY chunk of EVERY scene, so max can be many times slower."),
+                io.Int.Input("width", default=1344, min=32, max=8192, step=32, optional=True,
+                             tooltip="Generation canvas width — only used by ref_image_size=match."),
+                io.Int.Input("height", default=768, min=32, max=8192, step=32, optional=True,
+                             tooltip="Generation canvas height — only used by ref_image_size=match."),
+                io.Float.Input("audio_seconds_per_scene", default=10.0, min=1.0, max=60.0, step=0.5,
+                    tooltip="Window length T of the reference audio per scene: scene i is anchored to seconds [i*T, (i+1)*T) of the concatenated ref_audio_1..M track (10 s after 10 s, no overlap). Set T to the time one scene actually generates (chunks per scene x chunk length) so each scene is anchored to the musical/voice span it is generating. A final partial window is kept; scenes past the end of the track get image refs only (warning printed)."),
+                io.Autogrow.Input("ref_images", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("ref_image", tooltip="Reference image (identity/style/composition anchor) — attached to EVERY scene; reference it as <Picture N> in each scene's text. Socket order = <Picture N> order (same labels in every scene)."),
+                        prefix="ref_image_", min=0, max=9)),
+                io.Autogrow.Input("ref_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("ref_audio", tooltip="Reference audio (voice/beat/texture anchor). All connected files are concatenated in socket order, then cut into per-scene windows — each scene's window is its own <Audio 1>."),
+                        prefix="ref_audio_", min=0, max=3)),
+            ],
+            outputs=[io.Conditioning.Output(display_name="conditioning")],
+        )
+
+    @classmethod
+    @torch.inference_mode()
+    def execute(cls, conditioning, clip, vae=None, audio_vae=None,
+                ref_image_size="match", width=1344, height=768,
+                audio_seconds_per_scene=10.0,
+                ref_images=None, ref_audios=None):
+        ref_images = {k: v for k, v in (ref_images or {}).items()
+                      if v is not None}
+        ref_audios = {k: v for k, v in (ref_audios or {}).items()
+                      if v is not None}
+        if not ref_images and not ref_audios:
+            raise ValueError("connect at least one reference image and/or audio")
+        if ref_images and vae is None:
+            raise ValueError("encoding reference images needs the vae input")
+        if ref_audios and audio_vae is None:
+            raise ValueError("encoding reference audios needs the audio_vae input")
+        n_scenes = len(conditioning)
+        if n_scenes < 1:
+            raise ValueError("the conditioning holds no scenes — feed it from "
+                             "CLSSH3ScenePrompts (one entry per '---' block)")
+
+        img_pairs = []
+        for name in sorted(ref_images,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            img_pairs.append(_encode_ref_image_pair(
+                vae, ref_images[name], ref_image_size, width, height))
+
+        aud_pairs: list[list] = [[] for _ in range(n_scenes)]
+        _covered = 0
+        _win = _total = vae_sr = 0
+        if ref_audios:
+            track = None
+            for name in sorted(ref_audios,
+                               key=lambda n: int(n.rsplit("_", 1)[-1])):
+                w, _ = _ref_audio_waveform(audio_vae, ref_audios[name])
+                track = w if track is None else torch.cat([track, w], dim=-1)
+            vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+            _spf = max(1, round(vae_sr / AUDIO_LATENT_FPS))
+            _win = max(1, round(float(audio_seconds_per_scene)
+                                * AUDIO_LATENT_FPS)) * _spf
+            _total = int(track.shape[-1])
+            for i, (s, e) in enumerate(_ref_audio_window_bounds(
+                    _total, _win, n_scenes)):
+                if e - s < _spf:
+                    break
+                aud_pairs[i] = [_encode_ref_audio_slice(
+                    audio_vae, track[..., s:e].contiguous())]
+                _covered += 1
+
+        _aud_desc = (f"{_covered}/{n_scenes} window(s) of {_win / vae_sr:.1f}s "
+                     f"from {_total / vae_sr:.1f}s of audio"
+                     if ref_audios else "none")
+        print(f"[CLSS] all-scenes refs: {len(img_pairs)} image(s) -> ALL "
+              f"{n_scenes} scene(s) | audio: {_aud_desc}")
+        if ref_audios:
+            _used = min(_total, n_scenes * _win)
+            if _covered == n_scenes and _used < _total:
+                print(f"[CLSS] all-scenes refs: {(_total - _used) / vae_sr:.1f}s "
+                      f"of the ref audio is unused past the last scene — "
+                      f"raise audio_seconds_per_scene to use more of it.")
+            if _covered < n_scenes:
+                print(f"[CLSS] WARNING: ref audio covers {_covered}/{n_scenes} "
+                      f"scene(s) — scenes {_covered + 1}..{n_scenes} get image "
+                      f"refs only (raise audio_seconds_per_scene or shorten "
+                      f"the track).")
+
+        out = conditioning
+        for i in range(n_scenes):
+            pairs = img_pairs + aud_pairs[i]
+            if not pairs:
+                print(f"[CLSS] all-scenes refs: scene {i + 1} has no refs — "
+                      f"left as plain text conditioning.")
+                continue
+            out = _attach_scene_refs(clip, out, i + 1, pairs)
+        return io.NodeOutput(out)
 
 
 class _GuiderCLSSH3(comfy.samplers.CFGGuider):
-    """CFGGuider with independent video/audio CFG over the packed AV latent.
 
-    calc_cond_batch returns the packed [B, 1, N] denoised predictions
-    (model_base.py:250-253 packs the model's [video, audio] list output).
-    We unpack with the latent shapes recorded in sample(), apply
-    uncond + cfg·(cond − uncond) per stream, rescale each stream toward its
-    conditional prediction's std, and repack.  This is the minimal port of
-    the LTX `_GuiderCLSSAV`: no STG, no modality_scale, no per-modality sigma
-    re-derivation — H3's ModelSamplingAV owns the audio schedule internally.
-    """
-
-    # H3 is CFG-distilled: the stock graph runs cfg=1.0 (BasicGuider), and a
-    # live A/B measured cfg 4.0/7.0 corrupting BOTH streams into oversaturated
-    # glitch (latent std 0.93->1.13).  These class attributes are only a
-    # fallback — CLSSH3Guider.get_guider always overrides them through
-    # set_av_params — so keep them at the safe values.
     _video_cfg = 1.0
     _audio_cfg = 1.0
     _rescale = 0.7
@@ -755,8 +805,8 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
         self._video_cfg = video_cfg
         self._audio_cfg = audio_cfg
         self._rescale = rescale
-        self.set_cfg(video_cfg)      # feeds any non-AV fallback path
-        self.audio_cfg = audio_cfg   # telemetry introspection by the sampler
+        self.set_cfg(video_cfg)
+        self.audio_cfg = audio_cfg
 
     @staticmethod
     def _rescale_pred(pred: torch.Tensor, cond: torch.Tensor, r: float) -> torch.Tensor:
@@ -786,11 +836,6 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
         if (not is_nested and not is_packed_av) or negative is None:
             return super().predict_noise(x, timestep, model_options, seed)
         if self._video_cfg == 1.0 and self._audio_cfg == 1.0:
-            # cfg=1 on both streams is exactly a conditional-only pass
-            # (uncond + 1·(cond − uncond) ≡ cond, rescale ratio 1) — skip the
-            # uncond eval, halving model evals per step.
-            # calc_cond_batch ALWAYS returns a list (one entry per cond) —
-            # unwrap it, the sampler loop expects a bare tensor.
             return comfy.samplers.calc_cond_batch(
                 self.inner_model, [positive], x, timestep, model_options)[0]
 
@@ -842,9 +887,6 @@ class CLSSH3Guider:
 
     def get_guider(self, model, positive, negative, video_cfg, audio_cfg, rescale):
         if video_cfg != 1.0 or audio_cfg != 1.0:
-            # H3 is CFG-distilled: cfg 4/7 was measured live to corrupt frames
-            # into oversaturated glitch (latent std 0.93→1.13). Warn loudly —
-            # a stale browser tab can silently keep pre-fix widget values.
             print(f"[CLSS] WARNING: video_cfg={video_cfg} audio_cfg={audio_cfg} on "
                   f"CFG-distilled H3 — measured to corrupt output; use 1.0/1.0 unless "
                   f"you are deliberately experimenting.")
@@ -852,14 +894,6 @@ class CLSSH3Guider:
         guider.set_conds(positive, negative)
         guider.set_av_params(video_cfg, audio_cfg, rescale)
         return (guider,)
-
-
-# ---------------------------------------------------------------------------
-# Sliced noise: each chunk's initial noise is cut from one run-constant
-# full-length noise field so the new region's noise is continuous across the
-# seam (the overlap region gets fresh noise — it is re-noised by the mask
-# anyway).  H3 audio latents are [B, 32, 2, Ta]: time on the LAST axis.
-# ---------------------------------------------------------------------------
 
 
 class _SlicedNoise:
@@ -901,9 +935,19 @@ class _SlicedNoise:
         return noise_vid
 
 
-# ---------------------------------------------------------------------------
-# The streaming sampler
-# ---------------------------------------------------------------------------
+class _FreshAVNoise:
+
+    def __init__(self, vid_noise: torch.Tensor, aud_noise: torch.Tensor,
+                 seed: int):
+        self._vid = vid_noise
+        self._aud = aud_noise
+        self.seed = seed
+
+    def generate_noise(self, input_latent: dict):
+        samples = input_latent["samples"]
+        if isinstance(samples, comfy.nested_tensor.NestedTensor):
+            return comfy.nested_tensor.NestedTensor((self._vid, self._aud))
+        return self._vid
 
 
 class CLSSH3StreamingSampler:
@@ -924,6 +968,7 @@ class CLSSH3StreamingSampler:
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional i2v guide image; VAE-encoded and pinned as a minimax_keyframes row at frame 0 of chunk 0 (the H3-native first-frame conditioning). Requires vae."}),
                 "vae":   ("VAE",   {"tooltip": "Video VAE, only needed together with image for the i2v guide encode."}),
+                "audio_vae": ("VAE", {"tooltip": "Audio VAE (MiniMaxH3AudioVAE). When wired, the cross-chunk audio continuity reference is refreshed from the DECODED waveform at every boundary instead of being carried as latent state — the MiniMax H3 Motion Director technique (director/audio_context_refresh.py). A generated latent carries hidden state that drifts when fed back through the model on every chunk, which is what makes long chains stop sounding like music. Without it the latent is reused directly (fine for short chains). Also required by the audio recompose pass."}),
                 "fps": ("FLOAT", {
                     "default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
                     "tooltip": "Frames per second of the output. H3 is 24 fps native — the px↔audio time mapping is fixed (40 audio latent fps, temporal_shape), so any other value only triggers a warning and 24 is used.",
@@ -938,19 +983,47 @@ class CLSSH3StreamingSampler:
                     }),
                 "audio_guide_seconds": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.25,
-                    "tooltip": "Audio seam guide: pins the last N seconds of the previous chunk's audio as a cond_audio guide keyframe whose window ENDS exactly at the join and reaches BACKWARD (fractional/negative anchor index — the H3-Motion-Context pack's measured mechanism: seam correlation 0.45 -> 0.95+ vs reference placement; a forward/overlap-aligned guide makes the model loop the motif instead). The guide is the ONLY audio context: the overlap rows are fresh noise and the join is a plain cut. 1.0 s = 40 latent steps, the pack's validated default. 0 = off. Requires ComfyUI 0.34.0+ (fractional/negative keyframe anchors).",
+                    "tooltip": "Upper bound on the audio continuity context, in seconds. The context block spans the chunk overlap (the pixel frames the incoming chunk re-covers) and is capped by this value — so raising it only matters when the overlap is longer than this. The block's LENGTH is derived from its span (Motion Director's invariant: length and end position must describe the same pixel-frame span), which is what keeps it anchored to the join instead of floating off the timeline. 0 = no audio continuity context.",
+                    }),
+                "audio_xfade_ms": ("INT", {
+                    "default": 100, "min": 0, "max": 500, "step": 10,
+                    "tooltip": "Seam crossfade: the last N ms before each join are GENERATED by the incoming chunk (they are the tail of its audio overlap, a model-made continuation of the previous chunk) and linearly crossfaded against the previous chunk's delivered tail. MEASURED NECESSARY: with the crossfade off, aud_step went 1.294 -> 2.007 and aud_bnd +0.122 -> -0.210 — the join got audibly worse. It is independent of the ref_audio continuity block, which is what fixes chunk looping. 0 = plain cut. Capped at the overlap length and at the previous chunk's delivered length.",
+                    }),
+                "audio_refresh_waveform": (["off", "on"], {
+                    "default": "off",
+                    "tooltip": "Re-encode the cross-chunk audio continuity reference from its DECODED waveform at every boundary (Motion Director's audio_context_refresh). DEFAULT OFF to match Motion Director's order — they take the previous segment's LATENT directly and only fall back to the waveform. The VAE round-trip is LOSSY and compounds: each chunk's tail goes through one round-trip before becoming the next chunk's reference, so chunk N's context has been through N round-trips. Measured on a 3-chunk run: decoded level -19.1 / -19.1 / -28.4 dBFS and HF share 49.8 / 49.2 / 42.0%. Only enable if latent drift appears on very long chains.",
+                    }),
+                "audio_head_discard_ms": ("INT", {
+                    "default": 50, "min": 0, "max": 300, "step": 5,
+                    "tooltip": "Extra audio discarded from the start of each continuation chunk, on top of the context head. The recompose starts from pure noise, so a continuation chunk's opening is unstable: measured on the delivered waveform it plays ~14 ms, drops to -60 dBFS for ~22 ms, then slams back in — that hole-then-attack is the 'out of place / error' sound at the join, and it sits PAST the context head. Discarding ~50 ms of the opening removes it. Cost: the output is shorter by this amount per join. 0 = off.",
                     }),
                 "audio_cfg_cont": ("FLOAT", {
                     "default": 1.0, "min": 1.0, "max": 30.0, "step": 0.5,
                     "tooltip": "Audio CFG for CONTINUATION chunks (chunk 2+). Chunk 1 keeps the guider's audio_cfg and establishes the sound; every later chunk drops to this. DEFAULT 1.0 = off, and it is the measured fix for chunk-boundary section changes: the SLB overlap sits in the shared latent, so it is present in BOTH cond and uncond passes and cancels out of the CFG direction — at audio_cfg 4 the re-applied text prompt is amplified 4x while the tail context contributes nothing to guidance, so the model opens a NEW musical section at every join. With video_cfg 1.0 + this at 1.0 the guider also skips the uncond pass entirely (half the model evals per step on continuation chunks).",
                     }),
-                # How the text conditioning changes at a scene boundary:
-                # "transition_chunk" — two-step crossfade straddling the boundary: the
-                #   outgoing scene block's last chunk is guided by a 25%-incoming blend,
-                #   the incoming scene block's first chunk by 75%-incoming; needs every
-                #   scene block >= 2 chunks, i.e. num_chunks >= 2*scenes (3 scenes -> 6).
-                # "blend" — the first chunk of each new scene gets a single 50/50 blend.
-                # "hard"  — plain text swap (pre-crossfade baseline).
+                "audio_refine_guider": ("GUIDER", {
+                    "tooltip": "Separate GUIDER for the audio recompose pass — the measured fix for turbo-LoRA audio: wire a CLSSH3Guider built on the BASE model (no LoRA), with the SAME conditioning as the main guider. Turbo LoRAs are video-distilled, so recomposing WITH the turbo model re-cooks the same under-distilled audio head that made the bad take; the base model's music/voice head does the fresh take while the frozen video reference keeps the turbo look. Only used when audio_recompose_steps > 0. (Name kept for link compatibility — the refine pass itself was removed.)",
+                    }),
+                "audio_recompose_steps": ("INT", {
+                    "default": 0, "min": 0, "max": 30,
+                    "tooltip": "FRESH audio take per chunk against the FINISHED video (the actual turbo-audio fix): the chunk's turbo audio is discarded and re-generated from scratch (fresh noise, audio_recompose_sigma -> 0) by the audio_refine_guider model — wire the BASE model, NOT the turbo LoRA (recomposing with the turbo head re-cooks the same mush). The finished chunk video rides as a downscaled frozen ref2va video REFERENCE (the model's native ref path) and the target video stream is a 2-row dummy masked 0, so the pack shrinks ~10-25x and each step costs seconds instead of ~60s. Why not refine: measured — re-noising the turbo audio regenerates the SAME take (cos 0.90-0.96) because noise+video+text determine it; fresh noise is what changes the take. This is the in-model version of external V2A (MMAudio/ThinkSound) with H3's music/voice head intact. Runs BEFORE the refine pass when both are on. 0 = off.",
+                    }),
+                "audio_recompose_sigma": ("FLOAT", {
+                    "default": 1.0, "min": 0.50, "max": 1.0, "step": 0.05,
+                    "tooltip": "Start sigma of the recompose. 1.0 (DEFAULT) = full fresh take from pure noise: the audio is 100% re-imagined against the video reference, the end-aligned guide keyframe (seam pin) and the scene text. Lower values (0.6-0.9) turn it into a partial re-noise of the turbo take — keeps more of its timing/content, but also keeps more of its mush.",
+                    }),
+                "audio_recompose_pool": ("INT", {
+                    "default": 2, "min": 1, "max": 4, "step": 1,
+                    "tooltip": "Spatial downscale of the chunk-video reference before packing (the layout's area-normalized coords make a downscaled ref on-distribution). 2 (DEFAULT) = quarter of the video ref tokens; 4 = 1/16 (fastest, coarsest motion cue); 1 = full-res ref (audio sees every detail, ~4x the tokens of pool 2). Odd-safe: the ref is cropped to a 2xpool multiple first so patchify never sees an odd dim.",
+                    }),
+                "audio_recompose_stride": ("INT", {
+                    "default": 2, "min": 1, "max": 5, "step": 1,
+                    "tooltip": "Temporal stride over the reference's latent frames. 2 (DEFAULT) halves the ref tokens and still resolves beats/onsets at ~12 latent-fps (~0.3 s); 1 = every latent frame (tightest sync cues, 2x the ref tokens).",
+                    }),
+                "audio_recompose_seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Noise seed of the fresh take. 0 (DEFAULT) = derive per chunk from the run's NOISE seed (deterministic per run, different take per chunk). Any other value = used directly (plus a per-chunk offset). The exact per-chunk seed is printed in the 'recompose' log line, so a take you like is reproducible.",
+                    }),
                 "scene_handoff": (["transition_chunk", "blend", "hard"], {
                     "default": "transition_chunk",
                     "tooltip": "How text conditioning changes at a scene boundary. transition_chunk: two-step crossfade straddling the boundary — the outgoing scene's last chunk is guided by a 25%-incoming embedding blend, the incoming scene's first chunk by 75%-incoming (on LTX a single 50/50 chunk between far-apart scenes measured off-manifold and poisoned the next scene's SLB); needs every scene block ≥ 2 chunks. blend: single 50/50 blend on the first chunk of the new scene. hard: plain text swap.",
@@ -974,30 +1047,28 @@ class CLSSH3StreamingSampler:
         num_chunks: int,
         image=None,
         vae=None,
+        audio_vae=None,
         fps: float = 24.0,
         detail_anchor: str = "on",
         video_slb_tau_mult: float = 1.0,
         audio_guide_seconds: float = 1.0,
         audio_cfg_cont: float = 1.0,
+        audio_xfade_ms: int = 100,
+        audio_refresh_waveform: str = "off",
+        audio_head_discard_ms: int = 50,
         scene_handoff: str = "transition_chunk",
+        audio_recompose_steps: int = 0,
+        audio_recompose_sigma: float = 1.0,
+        audio_recompose_pool: int = 2,
+        audio_recompose_stride: int = 2,
+        audio_recompose_seed: int = 0,
+        audio_refine_guider=None,
     ):
         if fps != _NATIVE_FPS:
-            # The px↔audio time mapping is hard-wired (40 audio latent fps at
-            # 24 px fps — temporal_shape); a non-24 fps would silently desync
-            # the audio seam math, so refuse it rather than approximate.
             print(f"[CLSS] WARNING: fps={fps} requested but MiniMax H3 is "
                   f"{_NATIVE_FPS} fps native; using {_NATIVE_FPS}.")
         fps = float(_NATIVE_FPS)
 
-        # Guard the schedule: it is reused for EVERY chunk, each window starting
-        # at sigmas[0] and ending at sigmas[-1].  H3 is a flow model (CONST
-        # sampling, sigma in [0, 1]); BasicScheduler on the shifted model yields
-        # exactly [1.0 ... 0.0].  A foreign schedule (karras/exponential/beta
-        # from a non-H3 workflow) starts every chunk at sigma_max * noise with
-        # sigma_max >> 1 and drives the DiT's timestep labels out of range, and
-        # a schedule not terminating at 0 leaves the final latent noisy — in
-        # both cases the run COMPLETES but video AND audio decode as pure noise.
-        # Fail loudly instead of silently returning noise.
         _s = sigmas.flatten().float().cpu()
         if (_s.numel() < 2 or not (0.98 <= float(_s[0]) <= 1.02)
                 or float(_s[-1]) > 1e-4 or not bool((_s[:-1] >= _s[1:]).all())):
@@ -1006,6 +1077,17 @@ class CLSSH3StreamingSampler:
                 "from 1.0 to 0.0 (use BasicScheduler on the MiniMaxH3SigmaShift-"
                 f"patched model); got [0]={float(_s[0]):.6g} "
                 f"[-1]={float(_s[-1]):.6g} len={_s.numel()}")
+
+        if audio_refine_guider is not None and audio_recompose_steps <= 0:
+            print("[CLSS] WARNING: audio_refine_guider connected but "
+                  "audio_recompose_steps=0 — the recompose is off, the "
+                  "guider is unused.")
+        if audio_recompose_steps > 0 and audio_refine_guider is None:
+            print("[CLSS] WARNING: audio_recompose_steps > 0 without an "
+                  "audio_refine_guider — the recompose falls back to the "
+                  "MAIN guider; if that carries the turbo LoRA, the fresh "
+                  "take is cooked by the same under-distilled audio head "
+                  "that made the bad one. Wire a BASE-model CLSSH3Guider.")
 
         samples = latent["samples"]
         if not (getattr(samples, "is_nested", False) and len(samples.unbind()) == 2):
@@ -1020,24 +1102,19 @@ class CLSSH3StreamingSampler:
                              f"5k+2 grid (k>=1) — use EmptyMiniMaxH3LatentAV, which snaps "
                              f"the frame count to 17k+5 px")
         overlap = _snap_overlap(clss_config.overlap_latent_frames)
-        # chunk 0 contributes 5k+2 tokens (px 17k+5); every continuation chunk
-        # a multiple of 5 (px 17k) so chunk starts stay at absolute phase 2.
         new_cont = new_lf0 - 2
 
-        # ---- i2v guide image → keyframe row (H3-native first-frame pin) ----
         img_guide_latent: torch.Tensor | None = None
         if image is not None and vae is not None:
             img = image[:1, ..., :3].movedim(-1, 1)
             img = comfy.utils.common_upscale(img, W * 16, H * 16, "lanczos", "disabled")
-            img_guide_latent = vae.encode(img.movedim(1, -1))  # [1, 24, 1, H, W]
+            img_guide_latent = vae.encode(img.movedim(1, -1))
 
-        # ---- window budget: 12 s soft cap (H3 trained range ~5-15 s) ----
-        px0 = _px_of_tokens(new_lf0, 0)          # 17k+5
-        pxc = _px_of_tokens(new_cont, 2)         # 17k
+        px0 = _px_of_tokens(new_lf0, 0)
+        pxc = _px_of_tokens(new_cont, 2)
         cap_px = int(_WINDOW_CAP_S * fps)
         _eff_overlap = overlap
         _win_px = px0 if num_chunks == 1 else _px_of_tokens(_eff_overlap, 0) + max(px0, pxc)
-        # overlap clamp only matters when an SLB actually exists (chunk ≥ 1)
         while num_chunks > 1 and _win_px > cap_px and _eff_overlap > _MIN_OVERLAP_TOKENS:
             _eff_overlap -= 5
             _win_px = _px_of_tokens(_eff_overlap, 0) + max(px0, pxc)
@@ -1046,11 +1123,9 @@ class CLSSH3StreamingSampler:
         if _win_px <= cap_px:
             plan_tokens = [new_lf0] + [new_cont] * (num_chunks - 1)
         elif px_ol + max(px0, pxc) > cap_px:
-            # the chunk alone would exceed the cap even at minimum overlap:
-            # split into the fewest uniform grid-aligned sub-chunks that fit.
             rem = max(6, cap_px - px_ol)
-            max_new0 = 5 * max(1, (rem - 5) // 17) + 2   # px(5a+2 @phase0) = 17a+5 ≤ rem
-            max_newc = 5 * max(1, rem // 17)             # px(5b @phase2)  = 17b   ≤ rem
+            max_new0 = 5 * max(1, (rem - 5) // 17) + 2
+            max_newc = 5 * max(1, rem // 17)
             for _ci in range(num_chunks):
                 if _ci == 0:
                     plan_tokens.extend(_split_run(new_lf0, max_new0, plus2=True))
@@ -1066,10 +1141,7 @@ class CLSSH3StreamingSampler:
                   f"to keep windows under the {_WINDOW_CAP_S:.0f} s cap.")
             clss_config = dataclasses.replace(clss_config, overlap_latent_frames=_eff_overlap)
 
-        # per-chunk new audio frames from CUMULATIVE absolute px positions, so
-        # the concatenated audio matches round(total_px × 5/3) exactly
-        # (temporal_shape of the full video) with no per-chunk rounding drift.
-        chunk_plan: list[tuple[int, int, int]] = []   # (new video tokens, new audio frames, new px frames)
+        chunk_plan: list[tuple[int, int, int]] = []
         _p_acc = _a_acc = _t_acc = 0
         for _n in plan_tokens:
             _px_new = _px_of_tokens(_n, _t_acc % 5)
@@ -1082,26 +1154,11 @@ class CLSSH3StreamingSampler:
         T_total, Ta_total = _t_acc, _a_acc
         Ta_ol = _af_of_px(px_ol)
 
-        # ---- scene hand-off plan (_cond_plan), one entry per chunk:
-        #   int               → chunk guided by that scene's prompt alone
-        #   (int, int, float) → crossfade chunk guided by the embedding blend of
-        #                       (outgoing, incoming) scene with incoming weight w
-        #                       (_blend_scene_cond)
-        # "transition_chunk": TWO-STEP crossfade straddling each boundary — the
-        # outgoing scene's last chunk gets w=0.25 (mostly outgoing), the incoming
-        # scene's first chunk gets w=0.75 (mostly incoming).  A single 50/50
-        # chunk between far-apart scenes is off-manifold guidance: measured live
-        # on LTX, the 50/50 transition chunk drifted to anchor-sim 0.24 and
-        # poisoned the next scene's SLB.  A scene block needs >=2 chunks to host
-        # its half of the crossfade; 1-chunk blocks fall through to hard swaps.
         pos_conds = guider.original_conds.get("positive", [])
         num_scenes = len(pos_conds)
         _scene_of = [min(int(_i * num_scenes / _eff_num_chunks), num_scenes - 1)
                      if num_scenes > 1 else 0
                      for _i in range(_eff_num_chunks)]
-        # ---- run banner: every knob that shapes the run, printed once, so a
-        # telemetry dump is self-describing (which mult/guide produced which
-        # trend line is never in question again). ----
         _bn_px0 = chunk_plan[0][2]
         _bn_pxc = chunk_plan[1][2] if _eff_num_chunks > 1 else 0
         _bn_af0 = chunk_plan[0][1]
@@ -1131,11 +1188,20 @@ class CLSSH3StreamingSampler:
         print(f"[CLSS] video SLB tau_v {_tv0:.3f}->{_tvN:.3f} "
               f"(ceiling {_VIDEO_TAU_C_CEILING}) | audio: free overlap + "
               f"end-aligned guide, plain cut (no audio SLB — H3-MC mode)")
-        print(f"[CLSS] guide {audio_guide_seconds:.2f}s = "
-              f"{round(audio_guide_seconds * AUDIO_LATENT_FPS)}af end-aligned at "
-              f"join | detail_anchor {detail_anchor} | clss tau_c "
+        print(f"[CLSS] audio continuity: ref_audio block spanning the "
+              f"{px_ol}px overlap (latent, no VAE round-trip)"
+              f" | guide cap {audio_guide_seconds:.2f}s"
+              f" | seam xfade {audio_xfade_ms}ms "
+              f"({round(audio_xfade_ms * AUDIO_LATENT_FPS / 1000.0)}af)"
+              + f" | detail_anchor {detail_anchor} | clss tau_c "
               f"{clss_config.tau_c} beta {getattr(clss_config, 'beta', '?')} "
-              f"overlap {clss_config.overlap_latent_frames}tok")
+              f"overlap {clss_config.overlap_latent_frames}tok"
+              + (f" | audio RECOMPOSE {audio_recompose_steps} steps from "
+                 f"sigma {audio_recompose_sigma:.2f} (fresh noise, ref pool "
+                 f"x{audio_recompose_pool}/stride {audio_recompose_stride}, "
+                 f"{'base guider' if audio_refine_guider is not None else 'MAIN guider'})"
+                 if audio_recompose_steps > 0
+                 else ""))
         print(f"[CLSS] sigmas {_s.numel() - 1} steps "
               f"[{float(_s[0]):.3f}..{float(_s[-1]):.3f}] | cfg v="
               f"{getattr(guider, '_video_cfg', '?')} a="
@@ -1174,27 +1240,26 @@ class CLSSH3StreamingSampler:
               f"total {T_total} tokens / {_p_acc} px / {Ta_total} af "
               f"({_p_acc / fps:.1f} s), scenes={num_scenes}")
 
-        # ---- run-constant full-length noise fields ----
         _noise_seed = getattr(noise, "seed", 0)
-        # CPU template: generate_noise only reads shape/dtype, and the full-length
-        # field is ~0.4 GB fp32 at long totals — no reason to touch VRAM for it.
-        _noise_tmpl = torch.zeros(B, C_v, T_total, H, W)
+        refresh_on = (audio_refresh_waveform == "on")
+        _cap_v = max(T_total, _NOISE_FIELD_CAP_TOK)
+        _cap_a = max(Ta_total, _NOISE_FIELD_CAP_AF)
+        _noise_tmpl = torch.zeros(B, C_v, _cap_v, H, W)
         _full_noise_vid: torch.Tensor = noise.generate_noise({"samples": _noise_tmpl})
         del _noise_tmpl
         _g_aud = torch.Generator(device="cpu").manual_seed(
             (int(_noise_seed) + 1) % (2 ** 63))
-        _full_noise_aud = torch.randn(B_a, C_a, lanes_a, Ta_total,
+        _full_noise_aud = torch.randn(B_a, C_a, lanes_a, _cap_a,
                                       generator=_g_aud, dtype=aud_tmpl.dtype)
 
         clss_state = CLSSState(clss_config)
         acc_video: list[torch.Tensor] = []
         acc_audio: list[torch.Tensor] = []
         audio_chunk_ends: list[int] = []
-        # rolling kept-audio history (CPU, ends at the current join) — the
-        # source of the end-aligned guide window (see audio_guide_seconds)
         _audio_tail: torch.Tensor | None = None
         _s1_prev_last: torch.Tensor | None = None
         _s1_aud_rms_ref: float | None = None
+        _s1_aud_level_ref: float | None = None
         _s1_vid_std_ref: float | None = None
         _prev_scene_idx: int | None = None
         _s1_band_ref: tuple[float, float] | None = None
@@ -1213,10 +1278,15 @@ class CLSSH3StreamingSampler:
             "aud_wc": [], "aud_hf": [], "aud_hf_raw": [],
             "aud_peak": [], "aud_step": [], "aud_lag": [], "aud_lagf": [],
             "aud_loop": [], "aud_loopt": [], "vid_prev": [],
+            "aud_rcm": [], "aud_rcm_rms": [], "aud_rcm_s": [],
         }
 
         _vid_pos = 0
         _aud_pos = 0
+        _cfg_rc = (f" recompose={audio_recompose_steps}@"
+                   f"{audio_recompose_sigma:.2f}/p{audio_recompose_pool}"
+                   f"s{audio_recompose_stride}"
+                   if audio_recompose_steps > 0 else "")
         for chunk_idx in range(_eff_num_chunks):
             is_first = chunk_idx == 0
             _cur_new_lf, cur_new_af, _cur_new_px = chunk_plan[chunk_idx]
@@ -1226,9 +1296,6 @@ class CLSSH3StreamingSampler:
             total_lf = chunk_overlap + _cur_new_lf
             _plan_entry = _cond_plan[chunk_idx]
             _is_transition = isinstance(_plan_entry, tuple)
-            # A crossfade chunk statistically belongs to the scene its text leans
-            # toward (w < 0.5 → outgoing, w >= 0.5 → incoming): the per-scene ref
-            # resets (incl. the §2.3 EMA) fire on the first incoming-leaning chunk.
             scene_idx = (_plan_entry[1] if _plan_entry[2] >= 0.5 else _plan_entry[0]) \
                 if _is_transition else _plan_entry
             _scene_switch = (num_scenes > 1 and chunk_idx > 0
@@ -1240,66 +1307,42 @@ class CLSSH3StreamingSampler:
                 _origin_ref = None
                 _origin_layout = None
                 _s1_aud_rms_ref = None
+                _s1_aud_level_ref = None
                 _s1_audio_freq_ref = None
                 _s1_prev_vfeat = None
                 _hist_scene_start = len(acc_audio)
-                # §2.3: drop the old scene's EMA reference — the first chunk of the
-                # new scene is uncorrected and re-anchors the EMA (incl. _init_std).
                 clss_state.reset_drift_refs()
             _prev_scene_idx = scene_idx
             has_slb = not is_first and clss_state.overlap_latent is not None
-            # R2V refs riding this chunk's scene (transition chunks carry the
-            # lean scene's refs — _blend_scene_cond — and scene_idx IS the lean
-            # scene, so this label always matches the injected rows).
             _chunk_refs = pos_conds[scene_idx].get("minimax_refs") or []
             if _chunk_refs:
                 _ni = sum(1 for _r in _chunk_refs if _r.get("kind") == "image")
                 _na = sum(1 for _r in _chunk_refs if _r.get("kind") == "audio")
                 _cfg_r = f" refs={_ni}i+{_na}a"
 
-            # ---- conditioning: scene (+ crossfade blend) + keyframe rows ----
             keyframes: list[dict] = []
             if is_first and img_guide_latent is not None:
                 keyframes.append({"resolved_frame_index": 0, "latent": img_guide_latent})
-            # ---- audio seam guide: cond_audio keyframe, END-aligned at the
-            # join and reaching BACKWARD (H3-Motion-Context's measured
-            # mechanism: seam correlation 0.45 -> 0.95+ vs reference
-            # placement).  The pinned window must end at the join and reach
-            # backward into audio that already played — a fractional,
-            # negative resolved_frame_index, legal PackedLayout arithmetic
-            # that no stock node produces.  The join is already an integer
-            # on the 40 Hz grid, so no end snapping is needed. ----
+            _aud_ref_blk = None
             if (not is_first and audio_guide_seconds > 0.0
                     and _audio_tail is not None):
-                _join_af = _af_of_px(px_ol + _cur_new_px) - cur_new_af
-                _g = min(round(audio_guide_seconds * AUDIO_LATENT_FPS),
-                         _audio_tail.shape[-1])
-                if _g > 0 and _join_af > 0:
-                    _check_guide_layout()
-                    keyframes.append({
-                        # start coord = join - g  =>  index = (join - g)/RESCALE;
-                        # negative/fractional whenever g > overlap — intended.
-                        "resolved_frame_index": (_join_af - _g) / FRAME_RESCALE,
-                        "audio_latent": _audio_tail[..., -_g:],
-                    })
-                _cfg_g = (f"guide={_g}af@idx"
-                          f"{((_join_af - _g) / FRAME_RESCALE):+.2f}")
+                _span_px = float(px_ol)
+                _cap_px = audio_guide_seconds * float(_NATIVE_FPS)
+                if _span_px > _cap_px:
+                    _span_px = _cap_px
+                if _span_px > 0:
+                    _aud_ref_blk = _build_audio_ref_block(
+                        _audio_tail, audio_vae=audio_vae, device=device,
+                        span_px=_span_px, level_ref=_s1_aud_level_ref,
+                        refresh=refresh_on)
+                _src = ("wav" if (audio_vae is not None and refresh_on)
+                        else "lat")
+                _cfg_g = (f"audref={_aud_ref_blk['ref_audio_t'] if _aud_ref_blk else 0}"
+                          f"af({_src})")
             guider_chunk = copy.copy(guider)
-            # Per-chunk audio CFG: chunk 0 runs the guider's audio_cfg (it
-            # establishes the sound); every continuation chunk drops to
-            # audio_cfg_cont (default 1.0 = off).  Measured on live runs:
-            # the SLB overlap lives in the shared latent, so it is present
-            # in BOTH cond and uncond passes and cancels out of the CFG
-            # direction — at audio_cfg=4 the re-applied text prompt is
-            # amplified 4x while the tail context contributes nothing to
-            # guidance, and the model opens a NEW musical section at every
-            # join.  copy.copy is shallow and floats are immutable: this
-            # touches only the per-chunk copy, the user's guider keeps its
-            # values.  With video_cfg 1.0 + audio 1.0 _GuiderCLSSH3 skips
-            # the uncond pass entirely — half the model evals per step.
             if not is_first:
                 guider_chunk._audio_cfg = float(audio_cfg_cont)
-                guider_chunk.audio_cfg = float(audio_cfg_cont)  # telemetry attr
+                guider_chunk.audio_cfg = float(audio_cfg_cont)
             _cfg_s = f"acfg={getattr(guider_chunk, '_audio_cfg', '?')}"
             if num_scenes > 1 or keyframes:
                 _pos_entry = (_blend_scene_cond(pos_conds[_plan_entry[0]],
@@ -1308,18 +1351,17 @@ class CLSSH3StreamingSampler:
                               if _is_transition else pos_conds[scene_idx])
                 if keyframes:
                     _pos_entry = {**_pos_entry, "minimax_keyframes": keyframes}
+                if _aud_ref_blk is not None:
+                    _pos_entry = {
+                        **_pos_entry,
+                        "minimax_refs": [_aud_ref_blk]
+                        + list(_pos_entry.get("minimax_refs") or []),
+                    }
                 guider_chunk.original_conds = {
                     **guider.original_conds,
                     "positive": [_pos_entry],
                 }
 
-            # ---- chunk latent + per-stream denoise masks (§2.1) ----
-            # Video mask [1,1,T,1,1] / audio mask [1,1,2,Ta]: prepare_mask
-            # (comfy.utils.reshape_mask) interpolates them to the full latent
-            # grid; with T/Ta already exact the temporal values survive
-            # bit-exact, then _pool_masks_to_token_grid amaxes onto the 2x2
-            # patch / per-frame token grid and ceil-quantizes to 1/256 steps
-            # (model_base.py:2215-2232).
             lat_vid = torch.zeros(B, C_v, total_lf, H, W, device=device)
             mask_vid = torch.ones(1, 1, total_lf, 1, 1, device=device)
             if has_slb:
@@ -1330,25 +1372,15 @@ class CLSSH3StreamingSampler:
                 lat_vid[:, :, :_n_v] = _slb_v[:, :, :_n_v]
                 mask_vid[:, :, :_n_v] = _tau_c_v
                 _cfg_v = f"tau_v={_tau_c_v:.3f}"
-                # mask=0 verified to preserve: KSamplerX0Inpaint forces the
-                # region's x0 output to latent_image (out = out·m + lat·(1−m))
-                # and re-injects the cond-strength latent every step; the only
-                # impurity is scale_latent_inpaint's 0.1% cond-noise-aug
-                # (VISUAL_COND_TIMESTEP=0.999), which decays across steps as
-                # the pinned x0 pulls the row back onto the clean latent.
-                # Audio rows are even stricter (AUDIO_COND_TIMESTEP=1.0 — zero
-                # aug): mask=0 audio is exactly frozen.
-            # window audio length follows temporal_shape over the WHOLE window
-            # (round(window_px * 5/3)) — Ta_ol + cur_new_af double-rounds and can
-            # land ±1 audio frame off the model's px↔audio time map.
             chunk_af = _af_of_px((0 if is_first else px_ol) + _cur_new_px)
-            _Ta_ol_w = chunk_af - cur_new_af  # window-local audio overlap (≈Ta_ol)
+            _Ta_ol_w = chunk_af - cur_new_af
+            _xf_n = 0
+            if (not is_first and acc_audio and audio_xfade_ms > 0
+                    and _Ta_ol_w > 0):
+                _xf_n = min(round(audio_xfade_ms * AUDIO_LATENT_FPS / 1000.0),
+                            _Ta_ol_w, acc_audio[-1].shape[-1])
             lat_aud = torch.zeros(B_a, C_a, lanes_a, chunk_af, device=device)
             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
-            # Audio rows stay 100% fresh noise under an all-ones mask: the
-            # previous tail's only presence is the cond_audio guide keyframe
-            # above, and the rendered overlap is trimmed with a plain cut
-            # (H3-Motion-Context's recipe — no audio SLB, no crossfade).
             if not is_first:
                 _cfg_a = "aud=free"
             chunk_latent = {
@@ -1359,14 +1391,14 @@ class CLSSH3StreamingSampler:
             if is_first:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}: win {_cur_new_px}px/{chunk_af}af "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
             else:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}"
                       f"{' (transition)' if _is_transition else ''}: "
                       f"win {px_ol + _cur_new_px}px/{chunk_af}af "
                       f"join_af={_Ta_ol_w} (round {_Ta_ol_w - Ta_ol:+d}) "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
             _chunk_noise = _SlicedNoise(
                 _full_noise_vid, _vid_pos, chunk_overlap, seed=_noise_seed,
                 full_noise_aud=_full_noise_aud,
@@ -1382,11 +1414,122 @@ class CLSSH3StreamingSampler:
             )
             vid_out, aud_out = denoised["samples"].unbind()
 
-            # ---- §2.3 corrections on the new video frames ----
+            if audio_recompose_steps > 0:
+                _rc_pool = max(1, int(audio_recompose_pool))
+                _rc_stride = max(1, int(audio_recompose_stride))
+                _vr = vid_out
+                if _rc_pool > 1:
+                    _m = 2 * _rc_pool
+                    _vr = _vr[..., :(_vr.shape[-2] // _m) * _m,
+                              :(_vr.shape[-1] // _m) * _m]
+                    _vr = F.avg_pool3d(_vr, (1, _rc_pool, _rc_pool))
+                if _rc_stride > 1:
+                    _vr = _vr[:, :, ::_rc_stride]
+                _rc_vid = {
+                    "kind": "video",
+                    "latent_t": int(_vr.shape[2]),
+                    "latent_h": int(_vr.shape[3]),
+                    "latent_w": int(_vr.shape[4]),
+                    "ref_audio_t": 0,
+                    "latent": _vr.contiguous(),
+                    "audio_latent": None,
+                }
+                _rc_w = 2 * max(1, round(W / H))
+                _dummy_vid = torch.zeros(1, C_v, total_lf, 2, _rc_w,
+                                         device=device, dtype=vid_out.dtype)
+                if int(audio_recompose_seed) != 0:
+                    _rc_seed = (int(audio_recompose_seed)
+                                + 7919 * chunk_idx) % (2 ** 63)
+                else:
+                    _rc_seed = (int(_noise_seed) + 424_243
+                                + 1_000_003 * chunk_idx) % (2 ** 63)
+                _g_rc = torch.Generator(device="cpu").manual_seed(_rc_seed)
+                _rc_noise = _FreshAVNoise(
+                    torch.zeros(1, C_v, total_lf, 2, _rc_w,
+                                device=device, dtype=vid_out.dtype),
+                    torch.randn(aud_out.shape, generator=_g_rc,
+                                dtype=aud_out.dtype).to(device),
+                    seed=_rc_seed)
+                _rc_kf = ([{**kf, "latent": None} for kf in keyframes
+                           if kf.get("audio_latent") is not None] or None)
+                if audio_refine_guider is not None:
+                    _rc_guider = copy.copy(audio_refine_guider)
+                    _rc_base_conds = audio_refine_guider.original_conds
+                else:
+                    _rc_guider = copy.copy(guider)
+                    _rc_base_conds = guider.original_conds
+                _rc_aud_in = aud_out
+                _rc_mask_a = torch.ones(1, 1, lanes_a, aud_out.shape[-1],
+                                        device=device)
+                _rc_pe = (_blend_scene_cond(pos_conds[_plan_entry[0]],
+                                            pos_conds[_plan_entry[1]],
+                                            _plan_entry[2])
+                          if _is_transition else pos_conds[scene_idx])
+                _rc_pe = {**_rc_pe}
+                _rc_pe.pop("minimax_keyframes", None)
+                if _rc_kf:
+                    _rc_pe["minimax_keyframes"] = _rc_kf
+                _rc_pe["minimax_refs"] = (
+                    [_rc_vid]
+                    + ([_aud_ref_blk] if _aud_ref_blk is not None else [])
+                    + list(_rc_pe.get("minimax_refs") or []))
+                _rc_guider.original_conds = {
+                    **_rc_base_conds, "positive": [_rc_pe]}
+                _rcs = torch.linspace(float(audio_recompose_sigma), 0.0,
+                                      audio_recompose_steps + 1)
+                _rc_lat = {
+                    "samples": comfy.nested_tensor.NestedTensor(
+                        (_dummy_vid, _rc_aud_in)),
+                    "noise_mask": comfy.nested_tensor.NestedTensor((
+                        torch.zeros(1, 1, total_lf, 1, 1, device=device),
+                        _rc_mask_a)),
+                }
+                _full_tok = total_lf * (H // 2) * (W // 2)
+                _rc_tok = (int(_vr.shape[2]) * (_vr.shape[3] // 2)
+                           * (_vr.shape[4] // 2)
+                           + total_lf * (_rc_w // 2))
+                print(f"[CLSS] chunk {chunk_idx + 1}: recompose "
+                      f"{audio_recompose_steps} steps from sigma "
+                      f"{float(audio_recompose_sigma):.2f} (linear, fresh "
+                      f"noise seed {_rc_seed}) | pack {_rc_tok} video-side "
+                      f"tokens vs {_full_tok} full "
+                      f"(~{_full_tok / max(_rc_tok, 1):.0f}x fewer) | "
+                      f"ref {_vr.shape[2]}f@{_vr.shape[3]}x{_vr.shape[4]} "
+                      f"pool x{_rc_pool} stride {_rc_stride} | acfg="
+                      f"{float(getattr(_rc_guider, 'audio_cfg', 0.0)):.1f}"
+                      + (f" | audref {_aud_ref_blk['ref_audio_t']}af"
+                         f"({'wav' if (audio_vae is not None and refresh_on) else 'lat'})"
+                         if _aud_ref_blk is not None else ""))
+                _aud_pre_rc = aud_out
+                _t_rc = time.time()
+                _, _rc_out = SamplerCustomAdvanced().sample(
+                    noise=_rc_noise, guider=_rc_guider, sampler=sampler,
+                    sigmas=_rcs, latent_image=_rc_lat)
+                _dt_rc = time.time() - _t_rc
+                aud_out = _rc_out["samples"].unbind()[1]
+                if audio_refine_guider is not None:
+                    comfy.model_management.unload_model(audio_refine_guider.inner_model)
+                    comfy.model_management.soft_empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                with torch.no_grad():
+                    _rcm_cos = _aud_cos(_aud_pre_rc, aud_out)
+                    _rcm_rms = float(
+                        aud_out.float().pow(2).mean().sqrt()
+                        / _aud_pre_rc.float().pow(2).mean().sqrt()
+                        .clamp(min=1e-8))
+                _trend["aud_rcm"].append(_rcm_cos)
+                _trend["aud_rcm_rms"].append(_rcm_rms)
+                _trend["aud_rcm_s"].append(_dt_rc)
+                print(f"[CLSS] chunk {chunk_idx + 1}: recompose took "
+                      f"{_dt_rc:.1f}s ({_dt_rc / audio_recompose_steps:.2f}s/"
+                      f"step) | audio vs turbo take cos={_rcm_cos:.3f} rms "
+                      f"x{_rcm_rms:.2f} (LOW cos = a fresh take, unlike "
+                      f"the old re-noise refine's ~0.95 rewrite-of-the-same)")
+
             new_vid = vid_out[:, :, chunk_overlap:]
             corrected = clss_state.post_process(new_vid)
 
-            # two-band spatial detail anchor (fights the long-run detail fade)
             _da_x = corrected.float()
             _da_b, _da_c, _da_t, _da_h, _da_w = _da_x.shape
             _da_flat = _da_x.permute(0, 2, 1, 3, 4).contiguous().reshape(
@@ -1410,8 +1553,6 @@ class CLSSH3StreamingSampler:
                         _hf_share = _e_high_p / max(_e_low_p + _e_high_p, 1e-12)
             _trend["vid_hf"].append(_hf_share)
 
-            # per-scene origin telemetry (min cosine distance of the chunk's
-            # frames to the scene's first corrected frame + its coarse layout)
             if _origin_ref is None:
                 _origin_ref = corrected[:, :, -1:].detach().float().cpu()
                 _origin_layout = F.avg_pool2d(
@@ -1426,7 +1567,6 @@ class CLSSH3StreamingSampler:
                 _lsims.append(float(F.cosine_similarity(_fl, _origin_layout, dim=0)))
             _trend["vid_origin"].append(min(_osims))
 
-            # per-scene video-std anchor: soft gain toward the first chunk's std
             if _s1_vid_std_ref is None:
                 _s1_vid_std_ref = corrected.float().std().item()
             else:
@@ -1443,9 +1583,6 @@ class CLSSH3StreamingSampler:
             _trend["vid_intra"].append(_frame_cos(corrected[:, :, 0], corrected[:, :, -1]))
             if _s1_prev_last is not None:
                 _trend["vid_bnd"].append(_frame_cos(_s1_prev_last.to(device), corrected[:, :, 0]))
-            # coarse scene signature (channel means over space+time): catches
-            # the "morphs to a different scene halfway" failure that vid_bnd
-            # (single boundary frame) and vid_origin (vs chunk 0) both miss.
             _cur_vfeat = F.normalize(
                 corrected.float().mean(dim=(3, 4)).mean(dim=2), dim=1)
             if _s1_prev_vfeat is not None:
@@ -1454,10 +1591,31 @@ class CLSSH3StreamingSampler:
             _s1_prev_vfeat = _cur_vfeat.detach().cpu()
             _s1_prev_last = corrected[:, :, -1].cpu()
 
-            # ---- audio: keep the new frames, update the audio SLB ----
             aud_drop = _Ta_ol_w
             if aud_drop > 0 and aud_out.shape[-1] < aud_drop:
                 aud_drop = 0
+            if not is_first and audio_head_discard_ms > 0:
+                _extra = min(int(round(audio_head_discard_ms
+                                       * AUDIO_LATENT_FPS / 1000.0)),
+                             max(0, aud_out.shape[-1] - aud_drop - 1))
+                if _extra > 0:
+                    aud_drop += _extra
+            _xf = min(_xf_n, aud_drop)
+            if _xf > 0 and acc_audio and _xf <= acc_audio[-1].shape[-1]:
+                _prev_tail = acc_audio[-1]
+                _xf_w = torch.linspace(0.0, 1.0, _xf + 2,
+                                       device=aud_out.device,
+                                       dtype=torch.float32)[1:-1]
+                _xf_new = aud_out[..., aud_drop - _xf:aud_drop].float()
+                _xf_old = _prev_tail[..., -_xf:].float().to(aud_out.device)
+                _xf_blend = _xf_old * (1.0 - _xf_w) + _xf_new * _xf_w
+                acc_audio[-1] = torch.cat(
+                    [_prev_tail[..., :-_xf],
+                     _xf_blend.to(_prev_tail.dtype).cpu()], dim=-1)
+                if _audio_tail is not None and _audio_tail.shape[-1] >= _xf:
+                    _audio_tail = torch.cat(
+                        [_audio_tail[..., :-_xf],
+                         _xf_blend.to(_audio_tail.dtype).cpu()], dim=-1)
             new_aud = aud_out[..., aud_drop:]
             _env = new_aud.detach().float().pow(2).mean(dim=(0, 1, 2)).cpu()
             if _prev_aud_env is not None and len(_prev_aud_env) > 8:
@@ -1468,34 +1626,17 @@ class CLSSH3StreamingSampler:
                                                (_ea.norm() * _eb.norm() + 1e-8)))
             _prev_aud_env = _env
             if is_first:
-                # fade-in on the very first chunk only (a ramp at a chunk
-                # join would read as a level dip at the seam).
                 _n_fade = min(8, new_aud.shape[-1])
                 if _n_fade >= 2:
                     _ramp = torch.linspace(0.125, 1.0, _n_fade, device=device)
                     new_aud = new_aud.clone()
                     new_aud[..., :_n_fade] = new_aud[..., :_n_fade] * _ramp
-            # soft clip EVERY chunk, not just the first: each chunk's opening
-            # frames (right after the pinned overlap) overshoot the audio
-            # VAE's calibrated range the same way the run's opening does —
-            # delivered unclipped they land as transient "noise" starting
-            # exactly at every chunk join (seed-independent, rms-neutral,
-            # spectrogram-visible).  Gentle tanh knee above 3.5 sigma of the
-            # chunk's own level; transparent for in-range content.
             _fa = new_aud.float()
             _sig = _fa.std(dim=(2, 3), keepdim=True).clamp(min=1e-6)
             _over = (_fa.abs() - _sig * 3.5).clamp(min=0)
-            # gentle knee, 5-sigma ceiling (was a hard 4-sigma limiter): a
-            # limiter at 4 sigma sits ON percussive attacks — natural musical
-            # peaks run 4-6 sigma — and flattened them every chunk (measured:
-            # aud_peak pinned at ~4.0 every chunk, percussion audibly
-            # squashed).  The 1.5-sigma tanh wing preserves real transients
-            # while still taming pathological overshoot spikes to 5 sigma.
             new_aud = (_fa - torch.sign(_fa)
                        * (_over - 1.5 * _sig
                           * torch.tanh(_over / (1.5 * _sig)))).to(aud_out.dtype)
-            # overshoot alarm: peak/sigma of the delivered chunk.  A chunk
-            # arriving hot (>>7) means transients survived the clipper.
             _fa2 = new_aud.float()
             _trend["aud_peak"].append(float(
                 _fa2.abs().max() / _fa2.std().clamp(min=1e-8)))
@@ -1504,17 +1645,11 @@ class CLSSH3StreamingSampler:
                 _trend["aud_wc"].append(_aud_sims[-1])
             if _s1_aud_prev_last is not None:
                 _trend["aud_bnd"].append(_aud_cos(_s1_aud_prev_last.to(device), new_aud[..., :1]))
-            # §2.3 audio counterpart: per-scene RMS anchor (deadband, then a
-            # half-strength pull toward the scene's first chunk — same shape
-            # as the video std anchor above).  Without it the re-rendered
-            # chunks creep hot (+2-4 %/chunk measured: 0.45 -> 0.61 over a
-            # 10-chunk run) and the end-aligned guide pins the hot tail as
-            # the next chunk's clean reference — a compounding noise spiral.
-            # Applied BEFORE the SLB/tail bookkeeping so the guide and the
-            # next overlap carry the corrected audio.
             _cur_arms = new_aud.float().pow(2).mean().sqrt().item()
             if _s1_aud_rms_ref is None:
                 _s1_aud_rms_ref = _cur_arms
+                if _s1_aud_level_ref is None:
+                    _s1_aud_level_ref = _cur_arms
             else:
                 _ratio_a = _s1_aud_rms_ref / max(_cur_arms, 1e-6)
                 if _ratio_a < 0.94 or _ratio_a > 1.06:
@@ -1522,41 +1657,31 @@ class CLSSH3StreamingSampler:
                     new_aud = (new_aud.float() * _g_a).to(new_aud.dtype)
                     _cur_arms *= _g_a
             _trend["aud_rms"].append(_cur_arms)
+            _tail_n = min(int(round(audio_guide_seconds * AUDIO_LATENT_FPS)),
+                          new_aud.shape[-1])
+            if _tail_n > 0 and _s1_aud_level_ref is not None:
+                _tail = new_aud[..., -_tail_n:]
+                _t_rms = float(_tail.float().pow(2).mean().sqrt().item())
+                if _t_rms > 1e-9:
+                    _g_t = float(_s1_aud_level_ref) / _t_rms
+                    _g_t = max(0.5, min(3.0, _g_t))
+                    if abs(_g_t - 1.0) > 0.02:
+                        _r = torch.linspace(1.0, _g_t, _tail_n,
+                                            device=new_aud.device,
+                                            dtype=torch.float32)
+                        new_aud = new_aud.float().clone()
+                        new_aud[..., -_tail_n:] = (
+                            _tail.float() * _r.view(1, 1, 1, -1))
+                        new_aud = new_aud.to(aud_out.dtype)
             with torch.no_grad():
                 _freq_e = new_aud.float().abs().mean(dim=(0, 2, 3)).tolist()
             if _s1_audio_freq_ref is None:
                 _s1_audio_freq_ref = _freq_e
             else:
-                # raw (pre-correction) per-channel decay — what the anchor had
-                # to fight this chunk:
                 _freq_raw = [e / r if r > 1e-6 else 0.0
                              for e, r in zip(_freq_e, _s1_audio_freq_ref)]
                 if len(_freq_raw) >= 4:
                     _trend["aud_hf_raw"].append(sum(_freq_raw[-4:]) / 4.0)
-                # §2.3b audio spectral anchor.  The model's own output is
-                # slightly HF-deficient vs its training data, and each chunk's
-                # tail is fed back as guide/pin/SLB context — so every
-                # generation renders a little duller than its context and the
-                # decay COMPOUNDS (measured: aud_hf 1.00 -> 0.89 -> 0.80 over
-                # 3 chunks, 0.75 by chunk 10 — "quality drops with every
-                # chunk").  Video has the two-band detail anchor for exactly
-                # this and its vid_hf is dead flat; audio only had the scalar
-                # RMS anchor, which preserves total level but not spectral
-                # balance.  Mirror the video recipe per channel: gain =
-                # ref/cur (mean-abs amplitudes — no sqrt), clamped to
-                # [0.90, 1.12] per chunk, 0.5% deadband, anchored to the
-                # FIXED scene reference so it converges instead of ratcheting.
-                # TWO WIDE BANDS, not 32 narrow channels (v2 of this anchor):
-                # per-channel gains fought GENUINE content variation — a chunk
-                # whose instrumentation differs from chunk 0 got equalized
-                # toward chunk 0's exact spectrum ("instruments flatten out"),
-                # and with heterogeneous channels the post mean could land
-                # BELOW raw (bright channels clamp-cut at 0.90 while dull ones
-                # boosted only 1.12).  Wide bands average content variation
-                # out and correct only systematic tilt.  Bands mirror the
-                # aud_hf telemetry: hi = last 4 channels (where the measured
-                # decay lives), lo = the rest.  Hi clamp 1.20: the observed
-                # HF decay runs ~10-20%/chunk, past the video-derived 1.12.
                 _n_ch = len(_freq_e)
                 _lo_e = sum(_freq_e[:-4]) / max(1, _n_ch - 4)
                 _hi_e = sum(_freq_e[-4:]) / 4.0
@@ -1572,29 +1697,16 @@ class CLSSH3StreamingSampler:
                     new_aud = (new_aud * _gt).to(new_aud.dtype)
                     _freq_e = [_e * (_g_hi if _i >= _n_ch - 4 else _g_lo)
                                for _i, _e in enumerate(_freq_e)]
-                # delivered (post-correction) ratio — ≈1.0 means the anchor
-                # fully absorbed this chunk's decay; <1.0 means the clamp
-                # saturated and the decay outran it.
                 _freq_ratio = [e / r if r > 1e-6 else 0.0
                                for e, r in zip(_freq_e, _s1_audio_freq_ref)]
                 if len(_freq_ratio) >= 4:
                     _trend["aud_hf"].append(sum(_freq_ratio[-4:]) / 4.0)
-            # roll the audio history forward (final kept audio, post fade/clip);
-            # bounded to the longest guide window the widget allows.
             _audio_tail = (new_aud.cpu() if _audio_tail is None
                            else torch.cat([_audio_tail, new_aud.cpu()], dim=-1))
             _tail_keep = max(1, round(audio_guide_seconds * AUDIO_LATENT_FPS))
             if _audio_tail.shape[-1] > _tail_keep:
                 _audio_tail = _audio_tail[..., -_tail_keep:]
             if not is_first and acc_audio and new_aud.shape[-1] > 0:
-                # DELIVERED seam — what the listener actually gets.  aud_bnd
-                # above measures the raw edge of the model's continuation
-                # before the level/spectral anchors; aud_dlv measures the
-                # delivered seam after them, aud_lvl the 1 s RMS level step
-                # across it in dB (0 = no step; the audible "the room tone
-                # jumped" failure).  Concept stolen from H3-Motion-Context's
-                # Seam Probe (correlation / RMS step / floor step across a
-                # join).
                 _trend["aud_dlv"].append(_aud_cos(
                     acc_audio[-1][..., -1:].to(device), new_aud[..., :1]))
                 _Lw = min(round(AUDIO_LATENT_FPS), acc_audio[-1].shape[-1],
@@ -1605,15 +1717,6 @@ class CLSSH3StreamingSampler:
                     _trend["aud_lvl"].append(
                         20.0 * math.log10(float(_lv_new)
                                           / max(float(_lv_prev), 1e-8)))
-                # delivered-domain seam forensics (patch #10):
-                #   aud_step  — join jump / median jump (~1 = invisible seam)
-                #   aud_lag/@aud_lagf — best-lag corr across the seam; a
-                #     nonzero best lag = px<->audio rounding regression (25 ms)
-                #   aud_loop/@aud_loopt — max cosine of any 1 s window of the
-                #     new chunk against ALL previously delivered audio of this
-                #     scene, and where the match lives (seconds).  High =
-                #     the chunk repeats earlier material = loop-lock, measured
-                #     on delivered audio (aud_wc only sees WITHIN a chunk).
                 _trend["aud_step"].append(_aud_seam_step(
                     acc_audio[-1], new_aud.cpu()))
                 _lag_c, _lag_f = _aud_best_lag(acc_audio[-1], new_aud.cpu())
@@ -1628,9 +1731,6 @@ class CLSSH3StreamingSampler:
                         _loop_t + sum(a.shape[-1]
                                       for a in acc_audio[:_hist_scene_start])
                         / AUDIO_LATENT_FPS)
-                # _hist is None on the first chunk of a new scene: no
-                # scene-local history yet, loop detection N/A (the trend
-                # simply gets no entry for that chunk).
             acc_audio.append(new_aud.cpu())
             audio_chunk_ends.append(sum(a.shape[-1] for a in acc_audio))
             _s1_aud_prev_last = new_aud[..., -1:].cpu()
@@ -1639,8 +1739,6 @@ class CLSSH3StreamingSampler:
             _aud_pos += cur_new_af
 
         full_vid = torch.cat(acc_video, dim=2)
-        # End-of-run trend dump (structure metrics — they localize failures,
-        # they never prove a quality win).
         for _k, _v in _trend.items():
             if _v:
                 print(f"[CLSS] trend {_k}: " + " ".join(f"{_x:.3f}" for _x in _v))
@@ -1653,11 +1751,6 @@ class CLSSH3StreamingSampler:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return ({"samples": output_samples},)
-
-
-# ---------------------------------------------------------------------------
-# Streaming decode + save
-# ---------------------------------------------------------------------------
 
 
 class CLSSH3VideoDecodeSave:
@@ -1703,20 +1796,15 @@ class CLSSH3VideoDecodeSave:
         fsm = getattr(vae, "first_stage_model", None)
 
         def _px_for_tokens(n: int) -> int:
-            # exact px count of a standalone decode of n tokens
             if fsm is not None and hasattr(fsm, "decode_output_shape"):
                 return fsm.decode_output_shape((1, vid.shape[1], n, vid.shape[3], vid.shape[4]))[2]
-            return _px_of_tokens(n, 0)  # exact (1,4,4,4,4) token→px span, phase-0 anchored
+            return _px_of_tokens(n, 0)
 
         output_dir = folder_paths.get_output_directory()
         full_folder, filename, _, _, _ = folder_paths.get_save_image_path(
             filename_prefix, output_dir)
         os.makedirs(full_folder, exist_ok=True)
 
-        # Slice boundaries on the absolute 5-token grid (positions ≡ 0 mod 5):
-        # a standalone decode of a 5s-token slice yields exactly 17s px frames
-        # (and 17k+5 for the 5k+2 tail), so the slices tile the true px
-        # timeline with no gaps or duplicates — AV sync is preserved.
         step = 5 * max(1, round(frames_per_slice / 5))
         ctx = max(0, int(context_frames))
         frame_idx = 0
@@ -1725,11 +1813,7 @@ class CLSSH3VideoDecodeSave:
             end = min(pos + step, T)
             n_tok = end - pos
             c = 0 if pos == 0 else min(ctx, pos)
-            px = vae.decode(vid[:, :, pos - c:end])   # [B, T_px, H, W, 3] in [0,1]
-            # the prepended context occupies the FIRST c tokens of the decoded
-            # slice, whose px span is _px_for_tokens(c) — the old expression
-            # (px(c+n) − px(n)) is only exact for n ≡ 0 mod 5 and over-dropped
-            # up to 3 px on the 17k+2 (5k+2) tail slice, leaving a mid-video gap.
+            px = vae.decode(vid[:, :, pos - c:end])
             drop = _px_for_tokens(c) if c else 0
             arr = (px[0, drop:].float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
             for f in range(arr.shape[0]):
@@ -1740,8 +1824,6 @@ class CLSSH3VideoDecodeSave:
             del px, arr
             pos = end
 
-        # Stock VAEDecodeAudio logic (comfy_extras/nodes_audio.py:100-112):
-        # decode, move channels to dim 1, soft-normalize to ≤ 5 std.
         audio = audio_vae.decode(aud).movedim(-1, 1)
         std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
         std[std < 1.0] = 1.0
@@ -1759,6 +1841,7 @@ NODE_CLASS_MAPPINGS = {
     "CLSSH3ScenePrompts":     CLSSH3ScenePrompts,
     "CLSSH3SceneReference":   CLSSH3SceneReference,
     "CLSSH3SceneReferences":  CLSSH3SceneReferences,
+    "CLSSH3SceneReferencesAll": CLSSH3SceneReferencesAll,
     "CLSSH3StreamingSampler": CLSSH3StreamingSampler,
     "CLSSH3Guider":           CLSSH3Guider,
     "CLSSH3VideoDecodeSave":  CLSSH3VideoDecodeSave,
@@ -1768,6 +1851,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3ScenePrompts":     "CLSS H3 Scene Prompts",
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",
     "CLSSH3SceneReferences":  "CLSS H3 Scene References (R2V multi)",
+    "CLSSH3SceneReferencesAll": "CLSS H3 Scene References (R2V all scenes)",
     "CLSSH3StreamingSampler": "CLSS H3 Streaming Sampler",
     "CLSSH3Guider":           "CLSS H3 Guider (Split AV CFG)",
     "CLSSH3VideoDecodeSave":  "CLSS H3 Video Decode+Save (streaming)",

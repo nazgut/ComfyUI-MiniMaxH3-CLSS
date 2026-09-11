@@ -64,14 +64,18 @@ weights**:
 ## Repository layout
 
 ```
-nodes.py     # all 7 ComfyUI node implementations (incl. R2V scene-reference nodes:
+nodes.py     # all 8 ComfyUI node implementations (incl. R2V scene-reference nodes:
              # CLSSH3SceneReference single + CLSSH3SceneReferences V3-Autogrow multi,
              # re-tokenizing one scene's text with minimax_ref_items so <Picture N>/
-             # <Audio N> labels bind per scene)
+             # <Audio N> labels bind per scene; CLSSH3SceneReferencesAll applies
+             # images to every scene and auto-slices ref audio into per-scene
+             # windows — scene i gets seconds [i*T, (i+1)*T), T =
+             # audio_seconds_per_scene, via _ref_audio_window_bounds)
 clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, §2.3 EMA/AdaIN,
              # §2.5 anchor bank, post_process, reset_drift_refs) — no ltx imports
 __init__.py  # node-mapping exports only
 workflow/    # canonical workflows: t2v_minimaxh3_clss.json + t2v_with_ref_minimaxh3_clss.json
+             # + t2v_lora_minimaxh3_clss.json (turbo-LoRA + base-model audio recompose)
              # (API format). RULE: every experiment copies the canonical file — never
              # mutate it in place.
 ```
@@ -88,7 +92,9 @@ materially, port the change both ways by hand — there is no shared dependency.
 ```
 UNETLoader / ClipProjLoader (Qwen3-VL-4B + projection) / VAELoader×2 (video int8, audio bf16)
 CLSSH3ScenePrompts(CLIP, prompts)          → CONDITIONING (one entry per scene, '---' split;
-                                             used twice: positive scenes + negative)
+                                             optional global_text copied to the TOP of every
+                                             scene block before encoding; used twice:
+                                             positive scenes + negative)
 CLSSH3Guider(model, pos, neg, video_cfg 1.0, audio_cfg 1.0, rescale 0.7) → GUIDER
                                              # H3 is CFG-distilled — live A/B measured 4.0/7.0
                                              # corrupting output into oversaturated glitch frames;

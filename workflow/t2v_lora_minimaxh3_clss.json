@@ -1,0 +1,305 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Video VAE (H3) \u2014 decode+save uses this"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Audio VAE (H3) \u2014 decode+save uses this"
+    }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_hybrid_b20-49_pruned_w4a8_mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "BASE H3 model \u2014 feeds BOTH branches: turbo (26) and refine (28)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_int4_convrot.safetensors",
+      "type": "auto",
+      "projection": "mmh3-4b-ClipProj-v3.1-mlp.safetensors",
+      "device": "cuda:0",
+      "mode": "resident"
+    },
+    "class_type": "ClipProjLoader",
+    "_meta": {
+      "title": "CLIP text encoder \u2014 feeds both prompt nodes (5, 6)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "prompts": "subject_definitions:\n<Driver> is a tanned middle-aged man; only his forearms and black-leather-gloved hands are visible, gripping the steering wheel at ten and two.\n<Ferrari> is a classic red vintage convertible with a glossy long hood, chrome grille and a chrome hood emblem, black leather interior and a white-gauged dashboard.\n<Coast> is a winding Pacific Coast highway: deep blue ocean with whitecaps and scattered rocks to the right, dry golden-brown hills with green coastal scrub to the left.\n\nsummary:\nA single continuous first-person driving shot from the driver's seat. No cuts, no transitions - one slow, smooth take. The <Ferrari> glides through a gentle right-hand curve, then the road straightens toward a hazy coastal plain.\n\ndetailed_description:\nCinematic live action, shot on 35mm film, golden hour late-afternoon light, fine natural grain. Warm orange and yellow glare pours through the windshield across polished chrome and leather; long shadows stretch from the front wheels. Fixed, eye-level POV camera mounted just behind the steering wheel, looking straight ahead over the hood, framing the road's center line.\n\n[Shot 1] 00:00.000-00:10.000. Fixed POV over the hood. The <Ferrari> enters a gentle right-hand curve; the steering wheel rotates subtly in the <Driver>'s gloved hands, fingers tapping rhythmically. Whitecaps break on the <Coast>'s offshore rocks to the right while golden hills slide past on the left. As the road straightens, the wheel returns to center and the chrome hood emblem aligns with the vanishing point, where cliffs recede into a low hazy plain.\n\noverall_soundscape:\nN/A\n\nnon_diegetic_music:\nA pop song from 90' plays from the car radio in high quality, no artifacts, no noise.\n",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "POSITIVE prompt (scenes, --- separated) \u2014 wire to BOTH guiders (12 + 29)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "NEGATIVE prompt \u2014 wire to BOTH guiders (12 + 29)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "width": 832,
+      "height": 480,
+      "length": 243
+    },
+    "class_type": "EmptyMiniMaxH3LatentAV",
+    "_meta": {
+      "title": "Chunk template: 832x480, 243 px \u2248 10.1 s per chunk"
+    }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Sampler \u2014 shared by main pass and refine pass"
+    }
+  },
+  "9": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Scheduler (6 turbo steps) \u2014 model input stays on the TURBO branch (16)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise_seed": 1074607124357695
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Noise seed"
+    }
+  },
+  "12": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "rescale": 0.7,
+      "model": [
+        "16",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "GUIDER 1/2 \u2014 MAIN (turbo model, fast video) \u2192 sampler input 'guider'"
+    }
+  },
+  "14": {
+    "inputs": {
+      "filename_prefix": "clss_h3/CLSSH3_frame_",
+      "frames_per_slice": 27,
+      "context_frames": 0,
+      "fps": 24,
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "CLSSH3VideoDecodeSave",
+    "_meta": {
+      "title": "Decode + save video frames and audio"
+    }
+  },
+  "15": {
+    "inputs": {
+      "filename_prefix": "audio/CLSSH3",
+      "format": "flac",
+      "audio": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save audio (FLAC)"
+    }
+  },
+  "16": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "26",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "Sigma shift 12/6 \u2014 TURBO branch (after the LoRA)"
+    }
+  },
+  "23": {
+    "inputs": {
+      "tau_c": 0.05,
+      "beta": 0.4,
+      "overlap": 7
+    },
+    "class_type": "CLSSH3Config",
+    "_meta": {
+      "title": "CLSS config (seam + drift knobs)"
+    }
+  },
+  "26": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength": 1,
+      "low_vram": false,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "Turbo LoRA (4-8 steps; video-distilled, weak audio head)"
+    }
+  },
+  "28": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "Sigma shift 12/6 \u2014 RECOMPOSE branch (BASE model, NO LoRA). Keep shifts identical to node 16"
+    }
+  },
+  "29": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 4,
+      "rescale": 0.7,
+      "model": [
+        "28",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "GUIDER 2/2"
+    }
+  },
+  "30": {
+    "inputs": {
+      "num_chunks": 2,
+      "fps": 24,
+      "detail_anchor": "on",
+      "video_slb_tau_mult": 1,
+      "audio_guide_seconds": 2,
+      "audio_cfg_cont": 1,
+      "audio_recompose_steps": 20,
+      "audio_recompose_sigma": 1,
+      "audio_recompose_pool": 2,
+      "audio_recompose_stride": 2,
+      "audio_recompose_seed": 1074607124357695,
+      "scene_handoff": "hard",
+      "guider": [
+        "12",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "noise": [
+        "10",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ],
+      "clss_config": [
+        "23",
+        0
+      ],
+      "audio_refine_guider": [
+        "29",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "audio_head_discard_ms": 40,
+      "audio_refresh_waveform": "off"
+    },
+    "class_type": "CLSSH3StreamingSampler",
+    "_meta": {
+      "title": "CLSS STREAMING SAMPLER"
+    }
+  }
+}
