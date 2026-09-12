@@ -489,27 +489,20 @@ def _ref_audio_window_bounds(total_samples: int, window_samples: int,
     return out
 
 
-def _build_audio_ref_block(audio_tail: torch.Tensor, audio_vae=None,
-                           device=None, span_px: float = 0.0,
-                           level_ref: float | None = None,
-                           refresh: bool = False) -> dict | None:
+def _build_audio_ref_block(audio_tail: torch.Tensor, span_px: float = 0.0,
+                           level_ref: float | None = None) -> dict | None:
+    # The reference is the DELIVERED LATENT itself. The decoded-waveform
+    # refresh (VAE decode -> encode at every boundary) is NOT used: the
+    # round-trip is lossy and compounds, so chunk N's context would have been
+    # through N round-trips (measured on a 3-chunk run: decoded level
+    # -19.1/-19.1/-28.4 dBFS, HF share 49.8/49.2/42.0%). Motion Director
+    # takes the previous segment's latent directly too.
     if audio_tail is None or audio_tail.shape[-1] <= 0 or span_px <= 0:
         return None
     wanted = int(round(span_px / float(_NATIVE_FPS) * AUDIO_LATENT_FPS))
     if wanted <= 0:
         return None
     z = audio_tail[..., -wanted:] if audio_tail.shape[-1] > wanted else audio_tail
-    if audio_vae is not None and refresh:
-        try:
-            z_in = z.to(device) if device is not None else z
-            wav = audio_vae.decode(z_in)
-            if wav.ndim == 3:
-                wav = wav.movedim(-1, 1)
-            z = audio_vae.encode(wav[:1].movedim(1, -1))
-        except Exception as exc:
-            print(f"[CLSS] WARNING: audio-ref waveform refresh failed "
-                  f"({exc!r}); falling back to the delivered latent.")
-            z = audio_tail[..., -wanted:] if audio_tail.shape[-1] > wanted else audio_tail
     if z.ndim != 4 or z.shape[-1] <= 0:
         return None
     if level_ref is not None and level_ref > 1e-12:
@@ -1144,7 +1137,7 @@ class CLSSH3StreamingSampler:
             "required": {
                 "guider":      ("GUIDER",      {"tooltip": "GUIDER from CLSSH3Guider. When its positive conditioning holds N scene entries, one scene is unpacked per chunk proportionally across num_chunks."}),
                 "sampler":     ("SAMPLER",     {"tooltip": "SAMPLER for the per-chunk denoise (KSamplerSelect). The audio stream's own shifted schedule is handled inside the model (ModelSamplingAV); set shifts on the stock MiniMaxH3SigmaShift node."}),
-                "sigmas":      ("SIGMAS",      {"tooltip": "SIGMAS schedule (e.g. BasicScheduler, SplitSigmas, ManualSigmas). This is the video schedule; the audio schedule is derived from it inside the model. ANY slice of the 1.0→0.0 flow schedule is accepted: a low-res pass may END above 0 (its output is then upscaled) and a refine pass may START below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0) — connect refine_latent for that pass or the chunks start from pure noise."}),
+                "sigmas":      ("SIGMAS",      {"tooltip": "SIGMAS schedule (e.g. BasicScheduler, SplitSigmas, ManualSigmas). This is the video schedule; the audio schedule is derived from it inside the model. ANY slice of the 1.0→0.0 flow schedule is accepted: a low-res pass may END above 0 (its output is then upscaled, e.g. the split high half); a schedule may also START below 1.0 (partial generation — every chunk then starts from noise at σ0)."}),
                 "noise":       ("NOISE",       {"tooltip": "NOISE source (RandomNoise). Its seed drives the run-constant full-length noise tensors that each chunk's initial noise is sliced from."}),
                 "latent":      ("LATENT",      {"tooltip": "Per-chunk AV latent template from EmptyMiniMaxH3LatentAV (NestedTensor video [B,24,T,H/16,W/16] + audio [B,32,2,Ta]). Its frame count sets the per-chunk length; total length = num_chunks × chunk. T must be on the 5k+2 grid (the stock node guarantees this)."}),
                 "clss_config": ("CLSS_CONFIG", {"tooltip": "CLSS_CONFIG from the CLSSH3Config node (tau_c, beta, overlap)."}),
@@ -1155,8 +1148,6 @@ class CLSSH3StreamingSampler:
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional i2v guide image; VAE-encoded and pinned as a minimax_keyframes row at frame 0 of chunk 0 (the H3-native first-frame conditioning). Requires vae."}),
                 "vae":   ("VAE",   {"tooltip": "Video VAE, only needed together with image for the i2v guide encode."}),
-                "audio_vae": ("VAE", {"tooltip": "Audio VAE (MiniMaxH3AudioVAE). When wired, the cross-chunk audio continuity reference is refreshed from the DECODED waveform at every boundary instead of being carried as latent state — the MiniMax H3 Motion Director technique (director/audio_context_refresh.py). A generated latent carries hidden state that drifts when fed back through the model on every chunk, which is what makes long chains stop sounding like music. Without it the latent is reused directly (fine for short chains). Also required by the audio recompose pass."}),
-                "refine_latent": ("LATENT", {"tooltip": "OPTIONAL refine/hires base — connect a previous pass's full-length latent here (typically the low-res CLSS output AFTER a neural latent upscale, e.g. MinimaxH3LatentUpscaler 2D/3D) and start the schedule BELOW 1.0: each chunk is seeded from its slice of this latent, so flow noising starts at σ0·noise + (1−σ0)·base instead of pure noise (σ0 = sigmas[0]; at σ0=1.0 the base is multiplied by 0 and IGNORED). Seeding is positional and cumulative exactly like the sliced noise, so reuse the low-res pass's num_chunks/overlap; the spatial grid must match this node's chunk template (upscale first, then refine). Video-only latents are accepted (their audio windows start from noise); a nested AV latent (separate → upscale → LTXVConcatAVLatent with the pass-1 audio) refines both streams. Leave unconnected for a normal generation."}),
                 "upscaler": ("LATENT_UPSCALER", {"tooltip": "OPTIONAL neural latent upscaler (from CLSSH3LoadLatentUpscaleModel) applied INSIDE the stream: every chunk is upscaled CHUNK BY CHUNK right after its SLB step — the streaming state itself stays low-res, so a long video never exists at high resolution all at once (it is the per-chunk, memory-bounded version of the upscale→fix pipeline). Each chunk's full window (SLB overlap + new tokens) goes in for left temporal context, and the overlapping span is cross-faded over the previous chunk's delivered tail so upscale seams blend. The output latent is high-res VIDEO + unchanged audio — decode it as usual (expect more VRAM per decode slice; lower frames_per_slice if needed). The 2D upscaler variant is not supported here (loader loads the 3D module)."}),
                 "upscale_scale": ("FLOAT", {
                     "default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05,
@@ -1182,24 +1173,16 @@ class CLSSH3StreamingSampler:
                     "default": 100, "min": 0, "max": 500, "step": 10,
                     "tooltip": "Seam crossfade: the last N ms before each join are GENERATED by the incoming chunk (they are the tail of its audio overlap, a model-made continuation of the previous chunk) and linearly crossfaded against the previous chunk's delivered tail. MEASURED NECESSARY: with the crossfade off, aud_step went 1.294 -> 2.007 and aud_bnd +0.122 -> -0.210 — the join got audibly worse. It is independent of the ref_audio continuity block, which is what fixes chunk looping. 0 = plain cut. Capped at the overlap length and at the previous chunk's delivered length.",
                     }),
-                "audio_refresh_waveform": (["off", "on"], {
-                    "default": "off",
-                    "tooltip": "Re-encode the cross-chunk audio continuity reference from its DECODED waveform at every boundary (Motion Director's audio_context_refresh). DEFAULT OFF to match Motion Director's order — they take the previous segment's LATENT directly and only fall back to the waveform. The VAE round-trip is LOSSY and compounds: each chunk's tail goes through one round-trip before becoming the next chunk's reference, so chunk N's context has been through N round-trips. Measured on a 3-chunk run: decoded level -19.1 / -19.1 / -28.4 dBFS and HF share 49.8 / 49.2 / 42.0%. Only enable if latent drift appears on very long chains.",
-                    }),
                 "audio_head_discard_ms": ("INT", {
                     "default": 50, "min": 0, "max": 300, "step": 5,
                     "tooltip": "Extra audio discarded from the start of each continuation chunk, on top of the context head. The recompose starts from pure noise, so a continuation chunk's opening is unstable: measured on the delivered waveform it plays ~14 ms, drops to -60 dBFS for ~22 ms, then slams back in — that hole-then-attack is the 'out of place / error' sound at the join, and it sits PAST the context head. Discarding ~50 ms of the opening removes it. Cost: the output is shorter by this amount per join. 0 = off.",
                     }),
-                "audio_cfg_cont": ("FLOAT", {
-                    "default": 1.0, "min": 1.0, "max": 30.0, "step": 0.5,
-                    "tooltip": "Audio CFG for CONTINUATION chunks (chunk 2+). Chunk 1 keeps the guider's audio_cfg and establishes the sound; every later chunk drops to this. DEFAULT 1.0 = off, and it is the measured fix for chunk-boundary section changes: the SLB overlap sits in the shared latent, so it is present in BOTH cond and uncond passes and cancels out of the CFG direction — at audio_cfg 4 the re-applied text prompt is amplified 4x while the tail context contributes nothing to guidance, so the model opens a NEW musical section at every join. With video_cfg 1.0 + this at 1.0 the guider also skips the uncond pass entirely (half the model evals per step on continuation chunks).",
-                    }),
                 "audio_refine_guider": ("GUIDER", {
-                    "tooltip": "Separate GUIDER for the audio recompose pass — the measured fix for turbo-LoRA audio: wire a CLSSH3Guider built on the BASE model (no LoRA), with the SAME conditioning as the main guider. Turbo LoRAs are video-distilled, so recomposing WITH the turbo model re-cooks the same under-distilled audio head that made the bad take; the base model's music/voice head does the fresh take while the frozen video reference keeps the turbo look. Only used when audio_recompose_steps > 0. (Name kept for link compatibility — the refine pass itself was removed.)",
+                    "tooltip": "Separate GUIDER for the audio recompose pass — the measured fix for turbo-LoRA audio: wire a CLSSH3Guider built on the BASE model (no LoRA), with the SAME conditioning as the main guider. Turbo LoRAs are video-distilled, so recomposing WITH the turbo model re-cooks the same under-distilled audio head that made the bad take; the base model's music/voice head does the fresh take while the frozen video reference keeps the turbo look. Only used when audio_recompose_steps > 0.",
                     }),
                 "audio_recompose_steps": ("INT", {
                     "default": 0, "min": 0, "max": 30,
-                    "tooltip": "FRESH audio take per chunk against the FINISHED video (the actual turbo-audio fix): the chunk's turbo audio is discarded and re-generated from scratch (fresh noise, audio_recompose_sigma -> 0) by the audio_refine_guider model — wire the BASE model, NOT the turbo LoRA (recomposing with the turbo head re-cooks the same mush). The finished chunk video rides as a downscaled frozen ref2va video REFERENCE (the model's native ref path) and the target video stream is a 2-row dummy masked 0, so the pack shrinks ~10-25x and each step costs seconds instead of ~60s. Why not refine: measured — re-noising the turbo audio regenerates the SAME take (cos 0.90-0.96) because noise+video+text determine it; fresh noise is what changes the take. This is the in-model version of external V2A (MMAudio/ThinkSound) with H3's music/voice head intact. Runs BEFORE the refine pass when both are on. 0 = off.",
+                    "tooltip": "FRESH audio take per chunk against the FINISHED video (the actual turbo-audio fix): the chunk's turbo audio is discarded and re-generated from scratch (fresh noise, audio_recompose_sigma -> 0) by the audio_refine_guider model — wire the BASE model, NOT the turbo LoRA (recomposing with the turbo head re-cooks the same mush). The finished chunk video rides as a downscaled frozen ref2va video REFERENCE (the model's native ref path) and the target video stream is a 2-row dummy masked 0, so the pack shrinks ~10-25x and each step costs seconds instead of ~60s. Why not refine: measured — re-noising the turbo audio regenerates the SAME take (cos 0.90-0.96) because noise+video+text determine it; fresh noise is what changes the take. This is the in-model version of external V2A (MMAudio/ThinkSound) with H3's music/voice head intact. 0 = off.",
                     }),
                 "audio_recompose_sigma": ("FLOAT", {
                     "default": 1.0, "min": 0.50, "max": 1.0, "step": 0.05,
@@ -1240,17 +1223,13 @@ class CLSSH3StreamingSampler:
         num_chunks: int,
         image=None,
         vae=None,
-        audio_vae=None,
-        refine_latent=None,
         upscaler=None,
         upscale_scale: float = 1.5,
         fps: float = 24.0,
         detail_anchor: str = "on",
         video_slb_tau_mult: float = 1.0,
         audio_guide_seconds: float = 1.0,
-        audio_cfg_cont: float = 1.0,
         audio_xfade_ms: int = 100,
-        audio_refresh_waveform: str = "off",
         audio_head_discard_ms: int = 50,
         scene_handoff: str = "transition_chunk",
         audio_recompose_steps: int = 0,
@@ -1273,8 +1252,9 @@ class CLSSH3StreamingSampler:
                 "[CLSS] sigmas must be a monotonically decreasing flow schedule "
                 "within [0, 1] — ANY slice of the 1.0->0.0 schedule is accepted: "
                 "a low-res pass may END above 0 (its x0 estimate is then "
-                "upscaled) and a refine pass may START below 1.0 (e.g. 0.9035, "
-                "0.6316, 0.3158, 0.0 — connect refine_latent for that pass). "
+                "upscaled) and a partial schedule may START below 1.0 (e.g. "
+                "0.9035, 0.6316, 0.3158, 0.0 — every chunk then starts from "
+                "noise at sigma0). "
                 "Build it with BasicScheduler / SplitSigmas / ManualSigmas on the "
                 f"MiniMaxH3SigmaShift-patched model; got [0]={float(_s[0]):.6g} "
                 f"[-1]={float(_s[-1]):.6g} len={_s.numel()}")
@@ -1304,43 +1284,6 @@ class CLSSH3StreamingSampler:
                              f"the frame count to 17k+5 px")
         overlap = _snap_overlap(clss_config.overlap_latent_frames)
         new_cont = new_lf0 - 2
-
-        # Refine/hires base (optional): the previous pass's latent (typically
-        # after a neural latent upscale). Each chunk's window is seeded from the
-        # matching absolute slice — for chunk 0 the whole window, later chunks
-        # the whole window too, with the SLB overwriting the overlap region (the
-        # same precedence as a normal run). Flow noising then starts at
-        # sigma0*noise + (1-sigma0)*base (CONST.noise_scaling), which is why the
-        # schedule must start below 1.0 for the base to matter at all.
-        _refine_vid = _refine_aud = None
-        if refine_latent is not None:
-            _r_samples = refine_latent.get("samples")
-            if getattr(_r_samples, "is_nested", False):
-                _rt = _r_samples.unbind()
-                _refine_vid = _rt[0]
-                if len(_rt) > 1:
-                    _refine_aud = _rt[1]
-            else:
-                _refine_vid = _r_samples
-            if (getattr(_refine_vid, "ndim", 0) != 5 or _refine_vid.shape[0] != B
-                    or _refine_vid.shape[1] != C_v
-                    or tuple(_refine_vid.shape[3:]) != (H, W)):
-                raise ValueError(
-                    f"[CLSS] refine_latent video stream "
-                    f"{tuple(getattr(_refine_vid, 'shape', ()))} does not match "
-                    f"the chunk template (B={B}, C={C_v}, {H}x{W} latent grid) — "
-                    f"the refine latent must be at the SAME resolution as this "
-                    f"pass's EmptyMiniMaxH3LatentAV (upscale first, then refine "
-                    f"with a template upscaled to the same size).")
-            if _refine_aud is not None and (
-                    getattr(_refine_aud, "ndim", 0) != 4
-                    or _refine_aud.shape[0] != B_a or _refine_aud.shape[1] != C_a
-                    or _refine_aud.shape[2] != lanes_a):
-                print(f"[CLSS] WARNING: refine_latent audio stream "
-                      f"{tuple(getattr(_refine_aud, 'shape', ()))} does not match "
-                      f"the template ({B_a}, {C_a}, {lanes_a} lanes) — the audio "
-                      f"windows will start from noise.")
-                _refine_aud = None
 
         # Optional per-chunk upscale: validate + resolve target dims here (the
         # model itself moves onto the sampling device only when the run starts).
@@ -1419,33 +1362,6 @@ class CLSSH3StreamingSampler:
         T_total, Ta_total = _t_acc, _a_acc
         Ta_ol = _af_of_px(px_ol)
 
-        _sigma0 = float(_s[0])
-        if _refine_vid is None and _sigma0 < 0.999:
-            print(f"[CLSS] WARNING: partial schedule (sigma0={_sigma0:.4f}) without "
-                  f"a refine_latent — every chunk starts from ~pure noise at "
-                  f"sigma0, i.e. a denoise-style partial generation, not a refine. "
-                  f"Connect the upscaled/previous-pass latent to seed the chunks.")
-        if _refine_vid is not None and _sigma0 > 0.999:
-            print(f"[CLSS] WARNING: refine_latent is connected but the schedule "
-                  f"starts at sigma0={_sigma0:.4f} — flow noising multiplies the "
-                  f"base by (1-sigma0)~0, so the base is effectively IGNORED. "
-                  f"Start the schedule below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0).")
-        if _refine_vid is not None:
-            _rv_t = int(_refine_vid.shape[2])
-            _ra_t = int(_refine_aud.shape[-1]) if _refine_aud is not None else 0
-            print(f"[CLSS] refine pass: chunks seeded from refine_latent "
-                  f"({_rv_t} video tok / {_ra_t} audio frames) at "
-                  f"sigma0={_sigma0:.4f} — base weight (1-sigma0)="
-                  f"{1.0 - _sigma0:.3f} per stream, SLB keeps the overlap.")
-            if _rv_t < T_total:
-                print(f"[CLSS] WARNING: refine_latent covers {_rv_t} video tokens "
-                      f"< this pass's {T_total} — the tail beyond it starts from "
-                      f"noise (did both passes use the same num_chunks/overlap?).")
-            if _refine_aud is not None and _ra_t < Ta_total:
-                print(f"[CLSS] WARNING: refine_latent audio covers {_ra_t} frames "
-                      f"< this pass's {Ta_total} — the tail beyond it starts from "
-                      f"noise.")
-
         pos_conds = guider.original_conds.get("positive", [])
         num_scenes = len(pos_conds)
         _scene_of = [min(int(_i * num_scenes / _eff_num_chunks), num_scenes - 1)
@@ -1498,8 +1414,7 @@ class CLSSH3StreamingSampler:
               f"[{float(_s[0]):.3f}..{float(_s[-1]):.3f}] | cfg v="
               f"{getattr(guider, '_video_cfg', '?')} a="
               f"{getattr(guider, 'audio_cfg', '?')} rescale="
-              f"{getattr(guider, '_rescale', '?')} | audio cfg "
-              f"continuation chunks={audio_cfg_cont}")
+              f"{getattr(guider, '_rescale', '?')}")
         if _up_active:
             _up_note = (" [CPU — fp32 fallback, expect very slow]"
                         if _up_dev.type == "cpu" else "")
@@ -1541,7 +1456,6 @@ class CLSSH3StreamingSampler:
               f"({_p_acc / fps:.1f} s), scenes={num_scenes}")
 
         _noise_seed = getattr(noise, "seed", 0)
-        refresh_on = (audio_refresh_waveform == "on")
         _cap_v = max(T_total, _NOISE_FIELD_CAP_TOK)
         _cap_a = max(Ta_total, _NOISE_FIELD_CAP_AF)
         _noise_tmpl = torch.zeros(B, C_v, _cap_v, H, W)
@@ -1589,7 +1503,6 @@ class CLSSH3StreamingSampler:
                    f"{audio_recompose_sigma:.2f}/p{audio_recompose_pool}"
                    f"s{audio_recompose_stride}"
                    if audio_recompose_steps > 0 else "")
-        _cfg_b = " seed=refine" if _refine_vid is not None else ""
         for chunk_idx in range(_eff_num_chunks):
             is_first = chunk_idx == 0
             _cur_new_lf, cur_new_af, _cur_new_px = chunk_plan[chunk_idx]
@@ -1635,17 +1548,11 @@ class CLSSH3StreamingSampler:
                     _span_px = _cap_px
                 if _span_px > 0:
                     _aud_ref_blk = _build_audio_ref_block(
-                        _audio_tail, audio_vae=audio_vae, device=device,
-                        span_px=_span_px, level_ref=_s1_aud_level_ref,
-                        refresh=refresh_on)
-                _src = ("wav" if (audio_vae is not None and refresh_on)
-                        else "lat")
+                        _audio_tail, span_px=_span_px,
+                        level_ref=_s1_aud_level_ref)
                 _cfg_g = (f"audref={_aud_ref_blk['ref_audio_t'] if _aud_ref_blk else 0}"
-                          f"af({_src})")
+                          f"af(lat)")
             guider_chunk = copy.copy(guider)
-            if not is_first:
-                guider_chunk._audio_cfg = float(audio_cfg_cont)
-                guider_chunk.audio_cfg = float(audio_cfg_cont)
             _cfg_s = f"acfg={getattr(guider_chunk, '_audio_cfg', '?')}"
             if num_scenes > 1 or keyframes:
                 _pos_entry = (_blend_scene_cond(pos_conds[_plan_entry[0]],
@@ -1666,15 +1573,6 @@ class CLSSH3StreamingSampler:
                 }
 
             lat_vid = torch.zeros(B, C_v, total_lf, H, W, device=device)
-            if _refine_vid is not None:
-                # seed the whole window from the base latent's absolute slice
-                # [_vid_pos - chunk_overlap, ...); the SLB block below then
-                # overwrites the overlap region, same precedence as a normal run.
-                _v0 = max(0, _vid_pos - chunk_overlap)
-                _v1 = min(_v0 + total_lf, int(_refine_vid.shape[2]))
-                if _v1 > _v0:
-                    lat_vid[:, :, :_v1 - _v0] = _refine_vid[:, :, _v0:_v1].to(
-                        device=device, dtype=lat_vid.dtype)
             mask_vid = torch.ones(1, 1, total_lf, 1, 1, device=device)
             if has_slb:
                 _tau_c_v = _tau_c_eff(clss_config.tau_c * video_slb_tau_mult,
@@ -1692,14 +1590,6 @@ class CLSSH3StreamingSampler:
                 _xf_n = min(round(audio_xfade_ms * AUDIO_LATENT_FPS / 1000.0),
                             _Ta_ol_w, acc_audio[-1].shape[-1])
             lat_aud = torch.zeros(B_a, C_a, lanes_a, chunk_af, device=device)
-            if _refine_aud is not None:
-                # audio window frames map to absolute [_aud_pos - _Ta_ol_w, ...)
-                # (same mapping _SlicedNoise uses for the new-region noise slice)
-                _a0 = max(0, _aud_pos - _Ta_ol_w)
-                _a1 = min(_a0 + chunk_af, int(_refine_aud.shape[-1]))
-                if _a1 > _a0:
-                    lat_aud[..., :_a1 - _a0] = _refine_aud[..., _a0:_a1].to(
-                        device=device, dtype=lat_aud.dtype)
             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
             if not is_first:
                 _cfg_a = "aud=free"
@@ -1711,14 +1601,14 @@ class CLSSH3StreamingSampler:
             if is_first:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}: win {_cur_new_px}px/{chunk_af}af "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}{_cfg_b}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
             else:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}"
                       f"{' (transition)' if _is_transition else ''}: "
                       f"win {px_ol + _cur_new_px}px/{chunk_af}af "
                       f"join_af={_Ta_ol_w} (round {_Ta_ol_w - Ta_ol:+d}) "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}{_cfg_b}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
             _chunk_noise = _SlicedNoise(
                 _full_noise_vid, _vid_pos, chunk_overlap, seed=_noise_seed,
                 full_noise_aud=_full_noise_aud,
@@ -1817,8 +1707,7 @@ class CLSSH3StreamingSampler:
                       f"ref {_vr.shape[2]}f@{_vr.shape[3]}x{_vr.shape[4]} "
                       f"pool x{_rc_pool} stride {_rc_stride} | acfg="
                       f"{float(getattr(_rc_guider, 'audio_cfg', 0.0)):.1f}"
-                      + (f" | audref {_aud_ref_blk['ref_audio_t']}af"
-                         f"({'wav' if (audio_vae is not None and refresh_on) else 'lat'})"
+                      + (f" | audref {_aud_ref_blk['ref_audio_t']}af (lat)"
                          if _aud_ref_blk is not None else ""))
                 _aud_pre_rc = aud_out
                 _t_rc = time.time()

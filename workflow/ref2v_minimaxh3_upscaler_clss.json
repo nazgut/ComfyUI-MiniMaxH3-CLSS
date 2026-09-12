@@ -312,9 +312,7 @@
       "video_slb_tau_mult": 1,
       "audio_guide_seconds": 0,
       "audio_xfade_ms": 100,
-      "audio_refresh_waveform": "off",
       "audio_head_discard_ms": 50,
-      "audio_cfg_cont": 1,
       "audio_recompose_steps": 0,
       "audio_recompose_sigma": 1,
       "audio_recompose_pool": 2,
@@ -348,24 +346,11 @@
       "upscaler": [
         "77",
         0
-      ],
-      "sigmas_refine": [
-        "79",
-        0
       ]
     },
     "class_type": "CLSSH3StreamingSampler",
     "_meta": {
       "title": "CLSS H3 Streaming Sampler (6 chunks ≈ 56 s)"
-    }
-  },
-  "79": {
-    "inputs": {
-      "sigmas": "0.9035, 0.6316, 0.3158, 0.0000"
-    },
-    "class_type": "ManualSigmas",
-    "_meta": {
-      "title": "3 step Sigmas"
     }
   }
 }

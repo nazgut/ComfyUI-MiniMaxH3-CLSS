@@ -255,7 +255,6 @@
       "detail_anchor": "on",
       "video_slb_tau_mult": 1,
       "audio_guide_seconds": 2,
-      "audio_cfg_cont": 1,
       "audio_recompose_steps": 20,
       "audio_recompose_sigma": 1,
       "audio_recompose_pool": 2,
@@ -290,12 +289,7 @@
         "29",
         0
       ],
-      "audio_vae": [
-        "2",
-        0
-      ],
-      "audio_head_discard_ms": 40,
-      "audio_refresh_waveform": "off"
+      "audio_head_discard_ms": 40
     },
     "class_type": "CLSSH3StreamingSampler",
     "_meta": {

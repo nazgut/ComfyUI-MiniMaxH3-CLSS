@@ -203,7 +203,6 @@
       "detail_anchor": "on",
       "video_slb_tau_mult": 1,
       "audio_guide_seconds": 1,
-      "audio_cfg_cont": 1,
       "scene_handoff": "hard",
       "guider": [
         "12",

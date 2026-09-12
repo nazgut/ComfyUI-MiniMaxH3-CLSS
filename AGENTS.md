@@ -111,9 +111,8 @@ CLSSH3LoadLatentUpscaleModel               → LATENT_UPSCALER (optional; soft-i
 KSamplerSelect + BasicScheduler + RandomNoise → SAMPLER / SIGMAS / NOISE
 CLSSH3StreamingSampler(...)                → LATENT  (chunked, full telemetry;
                                              optional upscaler = per-chunk neural
-                                             upscale after each SLB step;
-                                             optional refine_latent + partial
-                                             schedule = hires refine pass)
+                                             upscale after each SLB step; any
+                                             slice of the 1.0→0.0 schedule)
 CLSSH3VideoDecodeSave(vae, audio_vae, ...) → PNG frames on disk + AUDIO
 ```
 
@@ -135,19 +134,10 @@ per-channel H3 normalisation, `target_size=(T, h', w')`, `enable_chunking=True`,
 to fp32. Per-chunk upscale time is printed (`[CLSS]   upscale N tok -> AxB px in
 Xs`).
 
-**Two-pass hires (upscale → refine):** the sampler accepts ANY slice of the
-1.0→0.0 flow schedule — a low-res pass may end above 0, a refine pass may start
-below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0). The optional `refine_latent`
-(LATENT) seeds every chunk's window positionally from a previous pass (low-res
-CLSS output after a neural latent upscale — video-only is accepted, e.g.
-separate → MinimaxH3LatentUpscaler → LTXVConcatAVLatent with the pass-1 audio).
-ComfyUI's `CONST.noise_scaling` then starts each chunk at
-`σ0·noise + (1−σ0)·base`, so σ0 must be < 1 for the base to matter (the sampler
-warns at σ0>1, and warns when a partial schedule has no refine_latent). Seeding
-is per-chunk positional (same cumulative math as `_SlicedNoise`), the SLB
-overwrites the overlap region *after* seeding, and the spatial grid must equal
-the (upscaled) chunk template — upscale first, then refine with a matching
-EmptyMiniMaxH3LatentAV.
+**Partial schedules:** the sampler accepts ANY slice of the 1.0→0.0 flow
+schedule — a low-res pass may end above 0 (its x0 is then what the upscaler
+carries), and a partial schedule may start below 1.0 (every chunk then starts
+from noise at σ0).
 
 `scene_handoff`: `transition_chunk` (default) = two-step crossfade straddling each
 boundary (outgoing block's last chunk 25%-incoming, incoming block's first chunk

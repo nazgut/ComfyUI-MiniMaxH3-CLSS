@@ -14,7 +14,7 @@ CLSS treats the chunk hand-off as a **feedback loop** and controls it. Chunks sh
 - **Two-band spatial detail anchor** — counters progressive high-frequency decay on long runs
 - **Audio seam guide** — the last N seconds of the previous chunk's audio are pinned as a `cond_audio` guide keyframe whose window **ends exactly at the join and reaches backward** (fractional/negative anchor index). This end-aligned placement is the measured mechanism that takes seam correlation from 0.45 to 0.95+; a forward/overlap-aligned guide makes the model loop the motif instead. The guide is the *only* audio context — overlap rows are fresh noise and the join is a plain cut
 - **Optional audio recompose** — per chunk, the generated audio is discarded and re-imagined from **pure noise** against the finished chunk video (downscaled frozen video reference + masked dummy target, so a step costs seconds instead of a full chunk), optionally by a separate **BASE-model** guider (`audio_refine_guider`). Fresh noise is what changes the take — re-noising measured cos 0.90–0.96, i.e. the same take — and turbo LoRAs are video-distilled, so recomposing with the turbo head re-cooks the same under-distilled audio. See [`workflow/t2v_lora_minimaxh3_clss.json`](workflow/t2v_lora_minimaxh3_clss.json)
-- **Split video/audio CFG with continuation-chunk falloff** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale. On continuation chunks `audio_cfg_cont` drops audio CFG (default 1.0 = off): the SLB overlap cancels out of the CFG direction, so high audio CFG at a join just amplifies the re-applied text prompt and opens a new musical section every chunk
+- **Split video/audio CFG** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale, uniformly to every chunk. (The SLB overlap cancels out of the CFG direction, so high audio CFG at a join mainly amplifies the re-applied text prompt — measured to open a new musical section every chunk; keep `audio_cfg` at 1.0 unless experimenting.)
 - **Optional i2v first-frame guide** — an image input is VAE-encoded and pinned as a `minimax_keyframes` row at frame 0 of chunk 0 (H3-native first-frame conditioning)
 - **Per-scene R2V references** — H3's ref2va mechanism split by scene: reference images/audios bind to `<Picture N>` / `<Audio N>` labels in one scene's prompt and ride only that scene's chunks; the all-scenes node fans images out to every scene and cuts a soundtrack into consecutive per-scene windows
 
@@ -44,9 +44,7 @@ The multi-ref node uses V3 Autogrow sockets (up to 9 images + 3 audios per scene
 
 ## Upscaling (neural latent upscaler)
 
-Two ways to use [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) with CLSS. Both need that pack installed (CLSS **soft-imports** its 3D model module at execute time — nothing is vendored) and a checkpoint in `models/latent_upscale_models/`.
-
-### 1. Chunk-by-chunk upscale inside the sampler (recommended)
+[Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) plugs into the sampler **chunk by chunk** — that pack must be installed (CLSS **soft-imports** its 3D model module at execute time — nothing is vendored) and its checkpoint placed in `models/latent_upscale_models/`.
 
 `CLSSH3LoadLatentUpscaleModel` → `CLSSH3StreamingSampler.upscaler` + `upscale_scale`:
 
@@ -55,15 +53,7 @@ Two ways to use [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-
 - The node returns high-res **video** + unchanged **audio** (the upscaler is spatial only; time is preserved). Set `EmptyMiniMaxH3LatentAV` to the **low-res** generation size — output = template × `upscale_scale`, aligned to the 32-px canvas rule (832×480 × 1.5 → 1248×720).
 - Costs ~0.7 GB extra VRAM for the upscaler (fp16) during the run; it is moved to the **compute device (CUDA)** at run start and offloaded afterwards. (Without CUDA it falls back to fp32 CPU inference, which is far too slow for this network — don't use it there.) Decoding the bigger latent needs more VRAM per slice — lower `frames_per_slice` in the decode node if needed.
 
-### 2. Two-pass refine (`refine_latent`)
-
-The hires pipeline with a second sampling pass, if you want the model (not just the network) to re-detail the upscaled latent:
-
-1. **Low-res pass** — `CLSSH3StreamingSampler` with the *high part* of the schedule (`BasicScheduler` → `SplitSigmas`, e.g. split at step 4). Its output is the model's x0 estimate at the split sigma (e.g. 0.9035) — soft, but complete.
-2. **Upscale** — separate the AV latent, run the video stream through the upscaler, then re-concat with the pass-1 audio (`LTXVConcatAVLatent`).
-3. **Refine pass** — `CLSSH3StreamingSampler` again at the target resolution with **`refine_latent` connected** and the *low part* of the schedule (e.g. `0.9035, 0.6316, 0.3158, 0.0000`). Each chunk is seeded from its slice of the upscaled latent, so flow noising starts at `σ0·noise + (1−σ0)·base` — the base keeps `1−σ0` of the start, so **start below 1.0 or the base is ignored** (the sampler warns). Alignment is positional, so reuse the low-res pass's `num_chunks` and overlap.
-
-Any slice of the 1.0→0.0 schedule is accepted by the sampler: one that ends above zero (upscale input), starts below 1.0 (refine), or both. A video-only `refine_latent` is fine — the audio windows then start from noise; a nested AV latent refines both streams.
+Any slice of the 1.0→0.0 schedule is accepted: a low-res pass may end above zero — its x0 is then what the upscaler carries — and a partial schedule may also start below 1.0, in which case every chunk starts from noise at σ0.
 
 ## Model files
 
@@ -107,7 +97,7 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 | **CLSS H3 Scene References (R2V multi)** | All of one scene's refs in one node — V3 Autogrow sockets, up to 9 images + 3 audios, socket order = label order |
 | **CLSS H3 Scene References (R2V all scenes)** | One node for the whole scene list: every image attaches to all scenes, the ref audio is concatenated and cut into consecutive per-scene windows (10 s after 10 s, `audio_seconds_per_scene`); replaces the per-scene chain |
 | **CLSS H3 Load Latent Upscale Model** | Loads a Minimax H3 latent-upscaler (3D) checkpoint from `models/latent_upscale_models` for the sampler's per-chunk upscale; the model code is soft-imported from the Comfyui_Minimax_h3_latent_Upscaler pack at execute time |
-| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), two-pass hires refine (`refine_latent` + a partial schedule), corrections, per-chunk telemetry + end-of-run trend summary |
+| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
@@ -131,13 +121,17 @@ Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL
 
 ## Updates
 
+**2026-09-12 — sampler option cleanup**
+
+- **Removed sampler options** — `refine_latent` (the two-pass refine), `audio_cfg_cont` (the guider's `audio_cfg` now applies to every chunk), `audio_refresh_waveform` and the sampler's `audio_vae` input (the audio continuity reference is always the delivered latent — the VAE round-trip was lossy and compounded). Dead keys dropped from the canonical workflows.
+
 **2026-09-11 — all-scene refs, global prompt text, audio recompose + seam controls**
 
-- **Chunk-by-chunk upscaling inside the sampler** — `CLSSH3LoadLatentUpscaleModel` + the sampler's `upscaler` / `upscale_scale`: every chunk is upscaled **after its SLB step** (full window in, overlap cross-faded over the previous tail), so a long video never exists at high res at once — the per-chunk, memory-bounded version of [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). See [Upscaling](#upscaling-neural-latent-upscaler). The sampler also accepts **any slice** of the 1.0→0.0 flow schedule (end above zero for a low-res pass, start below 1.0 for a refine pass) and the optional `refine_latent` seeds every chunk from a previous (e.g. upscaled) latent for the two-pass hires path.
+- **Chunk-by-chunk upscaling inside the sampler** — `CLSSH3LoadLatentUpscaleModel` + the sampler's `upscaler` / `upscale_scale`: every chunk is upscaled **after its SLB step** (full window in, overlap cross-faded over the previous tail), so a long video never exists at high res at once — the per-chunk, memory-bounded version of [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). See [Upscaling](#upscaling-neural-latent-upscaler). The sampler also accepts **any slice** of the 1.0→0.0 flow schedule (a low-res pass may end above zero; a partial schedule may also start below 1.0).
 - **All-scene R2V refs** — new `CLSSH3SceneReferencesAll` node: every `ref_image` attaches to ALL scenes, and the connected `ref_audio` file(s) are concatenated and cut into consecutive per-scene windows (`audio_seconds_per_scene`, default 10 s → "10 s after 10 s"). Replaces chaining one ref node per `---` block; [`t2v_with_ref_minimaxh3_clss.json`](workflow/t2v_with_ref_minimaxh3_clss.json) now uses it.
 - **`global_text` on `CLSSH3ScenePrompts`** — one text field copied to the top of every scene block before encoding, so shared style/section text is written once; the prefix is baked into each scene's text and survives the ref nodes' re-tokenization.
 - **Audio recompose** — `audio_recompose_steps` / `_sigma` / `_pool` / `_stride` / `_seed` + `audio_refine_guider`: per chunk, a fresh audio take from pure noise against the finished video (the measured fix for turbo-LoRA audio). New [`t2v_lora_minimaxh3_clss.json`](workflow/t2v_lora_minimaxh3_clss.json) ships the turbo-LoRA + base-model-recompose config.
-- **Audio seam controls** — the `ref_audio` continuity block is now placed through the H3 layout patch so it **ends exactly at the join** (length and end position decoupled); `audio_head_discard_ms` drops the unstable opening of continuation chunks; `audio_xfade_ms` crossfades the join; `audio_refresh_waveform` optionally re-encodes the continuity reference from the decoded waveform at every boundary.
+- **Audio seam controls** — the `ref_audio` continuity block is now placed through the H3 layout patch so it **ends exactly at the join** (length and end position decoupled); `audio_head_discard_ms` drops the unstable opening of continuation chunks; `audio_xfade_ms` crossfades the join.
 - **Determinism** — cross-chunk noise fields are generated at fixed caps, so chunk 1 is bit-identical regardless of `num_chunks` (`torch.randn` has no prefix property).
 - **Cleanup** — dead guide-layout check removed; the long inline design notes in `nodes.py` trimmed down to the measured facts (details live in this README and `AGENTS.md`).
 
