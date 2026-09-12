@@ -64,13 +64,17 @@ weights**:
 ## Repository layout
 
 ```
-nodes.py     # all 8 ComfyUI node implementations (incl. R2V scene-reference nodes:
+nodes.py     # all 9 ComfyUI node implementations (incl. R2V scene-reference nodes:
              # CLSSH3SceneReference single + CLSSH3SceneReferences V3-Autogrow multi,
              # re-tokenizing one scene's text with minimax_ref_items so <Picture N>/
              # <Audio N> labels bind per scene; CLSSH3SceneReferencesAll applies
              # images to every scene and auto-slices ref audio into per-scene
              # windows — scene i gets seconds [i*T, (i+1)*T), T =
-             # audio_seconds_per_scene, via _ref_audio_window_bounds)
+             # audio_seconds_per_scene, via _ref_audio_window_bounds; and
+             # CLSSH3LoadLatentUpscaleModel + the sampler's per-chunk upscaler,
+             # which SOFT-IMPORT their model module by file path at execute time
+             # from sibling custom_nodes/*/nodes/minimax_h3_latent_upscaler_3d.py
+             # — nothing vendored, no import-time code loading)
 clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, §2.3 EMA/AdaIN,
              # §2.5 anchor bank, post_process, reset_drift_refs) — no ltx imports
 __init__.py  # node-mapping exports only
@@ -102,10 +106,48 @@ CLSSH3Guider(model, pos, neg, video_cfg 1.0, audio_cfg 1.0, rescale 0.7) → GUI
 MiniMaxH3SigmaShift (stock, 12.0/6.0)      → MODEL (feeds guider + scheduler)
 EmptyMiniMaxH3LatentAV (stock)             → LATENT (per-chunk AV template, 5k+2 grid)
 CLSSH3Config                               → CLSS_CONFIG
+CLSSH3LoadLatentUpscaleModel               → LATENT_UPSCALER (optional; soft-imports
+                                             the sibling upscaler pack's 3D module)
 KSamplerSelect + BasicScheduler + RandomNoise → SAMPLER / SIGMAS / NOISE
-CLSSH3StreamingSampler(...)                → LATENT  (chunked, full telemetry)
+CLSSH3StreamingSampler(...)                → LATENT  (chunked, full telemetry;
+                                             optional upscaler = per-chunk neural
+                                             upscale after each SLB step;
+                                             optional refine_latent + partial
+                                             schedule = hires refine pass)
 CLSSH3VideoDecodeSave(vae, audio_vae, ...) → PNG frames on disk + AUDIO
 ```
+
+**Per-chunk upscale (in-sampler):** `upscaler` + `upscale_scale` (1.0–4.0) run the
+neural upscaler on EVERY chunk right after `clss_state.update_buffer(corrected)`
+— the streaming state (SLB, corrections, telemetry) stays low-res; only the
+delivered pixels grow. Input is the full window (`vid_out[:, :, :ov]` +
+`corrected`), output is appended minus the overlap tokens, and the overlap span
+is cross-faded over the previous chunk's delivered tail by
+`_blend_upscaled_overlap` (ramp 0→1; time is preserved by the upscaler, so token
+indices line up). Output latent = high-res video + unchanged audio; the model is
+moved to the **compute device** (`comfy.model_management.get_torch_device()`) at
+run start and offloaded at the end — NEVER to the latent's device: under
+ComfyUI's dynamic VRAM loading the AV template lives on CPU and fp16 inference
+on CPU is pathologically slow (measured: a 5-frame 8×8 latent took 205 s). The
+wrapper (`_H3UpscalerHandle.upscale`) mirrors the upscaler node's execute:
+per-channel H3 normalisation, `target_size=(T, h', w')`, `enable_chunking=True`,
+32-px canvas alignment (→ even latent dims); on a CPU-only machine it falls back
+to fp32. Per-chunk upscale time is printed (`[CLSS]   upscale N tok -> AxB px in
+Xs`).
+
+**Two-pass hires (upscale → refine):** the sampler accepts ANY slice of the
+1.0→0.0 flow schedule — a low-res pass may end above 0, a refine pass may start
+below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0). The optional `refine_latent`
+(LATENT) seeds every chunk's window positionally from a previous pass (low-res
+CLSS output after a neural latent upscale — video-only is accepted, e.g.
+separate → MinimaxH3LatentUpscaler → LTXVConcatAVLatent with the pass-1 audio).
+ComfyUI's `CONST.noise_scaling` then starts each chunk at
+`σ0·noise + (1−σ0)·base`, so σ0 must be < 1 for the base to matter (the sampler
+warns at σ0>1, and warns when a partial schedule has no refine_latent). Seeding
+is per-chunk positional (same cumulative math as `_SlicedNoise`), the SLB
+overwrites the overlap region *after* seeding, and the spatial grid must equal
+the (upscaled) chunk template — upscale first, then refine with a matching
+EmptyMiniMaxH3LatentAV.
 
 `scene_handoff`: `transition_chunk` (default) = two-step crossfade straddling each
 boundary (outgoing block's last chunk 25%-incoming, incoming block's first chunk

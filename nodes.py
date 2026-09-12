@@ -896,6 +896,193 @@ class CLSSH3Guider:
         return (guider,)
 
 
+# ---------------------------------------------------------------------------
+# Per-chunk neural latent upscaling. The model comes from the sibling
+# Comfyui_Minimax_h3_latent_Upscaler pack, SOFT-IMPORTED by file path at
+# execute time (nothing vendored, no import-time code loading). The sampler
+# upscales each chunk AFTER its SLB step: the streaming state stays low-res,
+# so a long video never exists at high resolution all at once.
+# ---------------------------------------------------------------------------
+
+_UPSCALE_MODEL_FOLDER = "latent_upscale_models"
+_H3_UPSCALER_DTYPES = {"fp32": torch.float32, "fp16": torch.float16,
+                       "bf16": torch.bfloat16}
+_H3_UPSCALER_MODULE = None
+_H3_UPSCALER_ERROR: str | None = None
+
+
+def _list_upscale_models() -> list[str]:
+    try:
+        import folder_paths
+        if _UPSCALE_MODEL_FOLDER not in folder_paths.folder_names_and_paths:
+            folder_paths.add_model_folder_path(
+                _UPSCALE_MODEL_FOLDER,
+                os.path.join(folder_paths.models_dir, _UPSCALE_MODEL_FOLDER))
+        names = [
+            n for n in folder_paths.get_filename_list(_UPSCALE_MODEL_FOLDER)
+            if os.path.splitext(n)[1].lower()
+            in (".safetensors", ".pt", ".pth", ".ckpt")
+        ]
+    except Exception as exc:
+        print(f"[CLSS] WARNING: cannot scan latent_upscale_models ({exc!r})")
+        names = []
+    return names or ["(place models in: models/latent_upscale_models)"]
+
+
+def _h3_upscaler_module():
+    """Lazily import the 3D module of the sibling Minimax H3 upscaler pack."""
+    global _H3_UPSCALER_MODULE, _H3_UPSCALER_ERROR
+    if _H3_UPSCALER_MODULE is not None:
+        return _H3_UPSCALER_MODULE
+    if _H3_UPSCALER_ERROR is not None:
+        raise RuntimeError(_H3_UPSCALER_ERROR)
+    import glob
+    import importlib.util
+    import sys as _sys
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _cands: list[str] = []
+    for _pat in ("*/nodes/minimax_h3_latent_upscaler_3d.py",
+                 "*/minimax_h3_latent_upscaler_3d.py"):
+        _cands += sorted(glob.glob(os.path.join(_root, _pat)))
+    if not _cands:
+        _H3_UPSCALER_ERROR = (
+            "[CLSS] the per-chunk upscaler needs the "
+            "'Comfyui_Minimax_h3_latent_Upscaler' custom node pack installed "
+            "next to this one (it is soft-imported by path, never vendored); "
+            f"no minimax_h3_latent_upscaler_3d.py found under {_root}/*/")
+        raise RuntimeError(_H3_UPSCALER_ERROR)
+    _spec = importlib.util.spec_from_file_location(
+        "clss_minimax_h3_latent_upscaler_3d", _cands[0])
+    _mod = importlib.util.module_from_spec(_spec)
+    _sys.modules[_spec.name] = _mod
+    _spec.loader.exec_module(_mod)
+    if not (hasattr(_mod, "load_model") and hasattr(_mod, "_make_norm_tensors")):
+        _H3_UPSCALER_ERROR = (
+            f"[CLSS] {_cands[0]} does not expose load_model/_make_norm_tensors — "
+            f"unsupported version of the upscaler pack")
+        raise RuntimeError(_H3_UPSCALER_ERROR)
+    print(f"[CLSS] latent upscaler: soft-imported {_cands[0]}")
+    _H3_UPSCALER_MODULE = _mod
+    return _mod
+
+
+def _blend_upscaled_overlap(acc_hr: list, up_hr: torch.Tensor,
+                            overlap: int) -> None:
+    """Cross-fade a chunk's upscaled overlap over the previous delivered tail.
+
+    ``up_hr`` is the upscaled full window (overlap + new tokens; the upscaler
+    preserves time), so its first ``overlap`` tokens re-cover the same absolute
+    span as the last ``overlap`` tokens already appended to ``acc_hr``. The
+    blend replaces that tail with a 0->1 ramp, so the transfer is gradual and
+    the seam lands where the new chunk becomes authoritative.
+    """
+    if not acc_hr or overlap <= 0:
+        return
+    _bl = min(overlap, acc_hr[-1].shape[2], up_hr.shape[2])
+    if _bl <= 0:
+        return
+    _ramp = torch.linspace(0.0, 1.0, _bl + 2, device=up_hr.device,
+                           dtype=torch.float32)[1:-1].view(1, 1, -1, 1, 1)
+    _prev = acc_hr[-1][:, :, -_bl:].to(up_hr.device).float()
+    _blend = _prev * (1.0 - _ramp) + up_hr[:, :, :_bl].float() * _ramp
+    acc_hr[-1] = torch.cat([acc_hr[-1][:, :, :-_bl],
+                            _blend.to(up_hr.dtype).cpu()], dim=2)
+
+
+class _H3UpscalerHandle:
+    """Loaded H3 latent-upscaler model + its normalisation, ready for slicing."""
+
+    def __init__(self, module, model, name, precision):
+        self.module = module
+        self.model = model
+        self.name = name
+        self.precision = precision
+
+    def _model_device(self) -> torch.device:
+        for p in self.model.parameters():
+            return p.device
+        return torch.device("cpu")
+
+    def _ensure_device(self, device) -> None:
+        dev = torch.device(device)
+        if self._model_device() != dev:
+            self.model.to(dev, non_blocking=True)
+
+    def to_device(self, device) -> None:
+        self._ensure_device(device)
+
+    def offload(self) -> None:
+        if self._model_device().type != "cpu":
+            self.model.to("cpu", non_blocking=True)
+            comfy.model_management.soft_empty_cache()
+            print(f"[CLSS] upscaler: offloaded {self.name} to CPU (VRAM released)")
+
+    def upscale(self, video: torch.Tensor, scale: float,
+                device=None) -> torch.Tensor:
+        """[B,24,T,h,w] -> [B,24,T,h',w'] (time preserved, 32-px canvas rule).
+
+        Mirrors the upscaler node's own execute: per-channel H3 normalisation,
+        trilinear target size, de-normalisation. Runs on the COMPUTE device
+        (comfy get_torch_device), NOT on the latent's device: under ComfyUI's
+        dynamic VRAM loading the AV latent template lives on CPU, and fp16
+        inference on CPU is pathologically slow (a 345M 3D conv net at 1 MP can
+        hang for tens of minutes) — CPU falls back to fp32.
+        """
+        mod = self.module
+        dev = torch.device(device) if device is not None \
+            else comfy.model_management.get_torch_device()
+        _b, _c, t, h_in, w_in = video.shape
+        # 32-px canvas alignment collapses to even latent dims (align 32 = 2*16)
+        w_out = max(2, 2 * round(w_in * float(scale) / 2))
+        h_out = max(2, 2 * round(h_in * float(scale) / 2))
+        if w_out == w_in and h_out == h_in:
+            return video
+        dtype = (_H3_UPSCALER_DTYPES.get(self.precision, torch.float16)
+                 if dev.type != "cpu" else torch.float32)
+        self._ensure_device(dev)
+        if dev.type != "cpu":
+            comfy.model_management.soft_empty_cache()
+        mean, std = mod._make_norm_tensors(dev, dtype)
+        s_norm = (video.to(device=dev, dtype=dtype) - mean) / std
+        eff = (w_out * 16 / (w_in * 16) + h_out * 16 / (h_in * 16)) / 2.0
+        out = self.model(s_norm, scale=eff, target_size=(t, h_out, w_out),
+                         enable_chunking=True)
+        out = out * std + mean
+        return out.to(dtype=video.dtype, device=video.device)
+
+
+class CLSSH3LoadLatentUpscaleModel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (_list_upscale_models(), {
+                    "tooltip": "Minimax H3 latent-upscaler checkpoint from models/latent_upscale_models (same files the Comfyui_Minimax_h3_latent_Upscaler pack uses — the model architecture is soft-imported from that pack at execute time, so it must be installed). Loaded on CPU; the streaming sampler moves it to the COMPUTE device (CUDA) for the run (~0.7 GB VRAM at fp16) and offloads it afterwards. On a machine without CUDA the upscaler falls back to fp32 CPU inference, which is very slow — don't use it there.",
+                    }),
+                "precision": (["fp16", "bf16", "fp32"], {
+                    "default": "fp16",
+                    "tooltip": "Inference precision. fp16 (DEFAULT) matches the validated checkpoints; bf16 if you see fp16 overflow; fp32 for exact reference math (slow, 2x memory).",
+                    }),
+            },
+        }
+    RETURN_TYPES = ("LATENT_UPSCALER",)
+    RETURN_NAMES = ("upscaler",)
+    FUNCTION = "load"
+    CATEGORY = "MiniMaxH3-CLSS"
+
+    def load(self, model_name, precision="fp16"):
+        if model_name.startswith("("):
+            raise ValueError(
+                "place a Minimax H3 latent-upscaler checkpoint in "
+                "models/latent_upscale_models (the same files the "
+                "Comfyui_Minimax_h3_latent_Upscaler pack scans)")
+        mod = _h3_upscaler_module()
+        model = mod.load_model(model_name, torch.device("cpu"), precision)
+        print(f"[CLSS] latent upscaler ready: {model_name} ({precision}) — the "
+              f"streaming sampler upscales chunk-by-chunk after each SLB step.")
+        return (_H3UpscalerHandle(mod, model, model_name, precision),)
+
+
 class _SlicedNoise:
     def __init__(self, full_noise_vid: torch.Tensor, pos: int, chunk_overlap: int, seed: int = 0,
                  full_noise_aud: torch.Tensor | None = None, a_pos: int = 0, a_overlap: int = 0):
@@ -957,7 +1144,7 @@ class CLSSH3StreamingSampler:
             "required": {
                 "guider":      ("GUIDER",      {"tooltip": "GUIDER from CLSSH3Guider. When its positive conditioning holds N scene entries, one scene is unpacked per chunk proportionally across num_chunks."}),
                 "sampler":     ("SAMPLER",     {"tooltip": "SAMPLER for the per-chunk denoise (KSamplerSelect). The audio stream's own shifted schedule is handled inside the model (ModelSamplingAV); set shifts on the stock MiniMaxH3SigmaShift node."}),
-                "sigmas":      ("SIGMAS",      {"tooltip": "SIGMAS schedule (e.g. BasicScheduler). This is the video schedule; the audio schedule is derived from it inside the model."}),
+                "sigmas":      ("SIGMAS",      {"tooltip": "SIGMAS schedule (e.g. BasicScheduler, SplitSigmas, ManualSigmas). This is the video schedule; the audio schedule is derived from it inside the model. ANY slice of the 1.0→0.0 flow schedule is accepted: a low-res pass may END above 0 (its output is then upscaled) and a refine pass may START below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0) — connect refine_latent for that pass or the chunks start from pure noise."}),
                 "noise":       ("NOISE",       {"tooltip": "NOISE source (RandomNoise). Its seed drives the run-constant full-length noise tensors that each chunk's initial noise is sliced from."}),
                 "latent":      ("LATENT",      {"tooltip": "Per-chunk AV latent template from EmptyMiniMaxH3LatentAV (NestedTensor video [B,24,T,H/16,W/16] + audio [B,32,2,Ta]). Its frame count sets the per-chunk length; total length = num_chunks × chunk. T must be on the 5k+2 grid (the stock node guarantees this)."}),
                 "clss_config": ("CLSS_CONFIG", {"tooltip": "CLSS_CONFIG from the CLSSH3Config node (tau_c, beta, overlap)."}),
@@ -969,6 +1156,12 @@ class CLSSH3StreamingSampler:
                 "image": ("IMAGE", {"tooltip": "Optional i2v guide image; VAE-encoded and pinned as a minimax_keyframes row at frame 0 of chunk 0 (the H3-native first-frame conditioning). Requires vae."}),
                 "vae":   ("VAE",   {"tooltip": "Video VAE, only needed together with image for the i2v guide encode."}),
                 "audio_vae": ("VAE", {"tooltip": "Audio VAE (MiniMaxH3AudioVAE). When wired, the cross-chunk audio continuity reference is refreshed from the DECODED waveform at every boundary instead of being carried as latent state — the MiniMax H3 Motion Director technique (director/audio_context_refresh.py). A generated latent carries hidden state that drifts when fed back through the model on every chunk, which is what makes long chains stop sounding like music. Without it the latent is reused directly (fine for short chains). Also required by the audio recompose pass."}),
+                "refine_latent": ("LATENT", {"tooltip": "OPTIONAL refine/hires base — connect a previous pass's full-length latent here (typically the low-res CLSS output AFTER a neural latent upscale, e.g. MinimaxH3LatentUpscaler 2D/3D) and start the schedule BELOW 1.0: each chunk is seeded from its slice of this latent, so flow noising starts at σ0·noise + (1−σ0)·base instead of pure noise (σ0 = sigmas[0]; at σ0=1.0 the base is multiplied by 0 and IGNORED). Seeding is positional and cumulative exactly like the sliced noise, so reuse the low-res pass's num_chunks/overlap; the spatial grid must match this node's chunk template (upscale first, then refine). Video-only latents are accepted (their audio windows start from noise); a nested AV latent (separate → upscale → LTXVConcatAVLatent with the pass-1 audio) refines both streams. Leave unconnected for a normal generation."}),
+                "upscaler": ("LATENT_UPSCALER", {"tooltip": "OPTIONAL neural latent upscaler (from CLSSH3LoadLatentUpscaleModel) applied INSIDE the stream: every chunk is upscaled CHUNK BY CHUNK right after its SLB step — the streaming state itself stays low-res, so a long video never exists at high resolution all at once (it is the per-chunk, memory-bounded version of the upscale→fix pipeline). Each chunk's full window (SLB overlap + new tokens) goes in for left temporal context, and the overlapping span is cross-faded over the previous chunk's delivered tail so upscale seams blend. The output latent is high-res VIDEO + unchanged audio — decode it as usual (expect more VRAM per decode slice; lower frames_per_slice if needed). The 2D upscaler variant is not supported here (loader loads the 3D module)."}),
+                "upscale_scale": ("FLOAT", {
+                    "default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05,
+                    "tooltip": "Spatial upscale factor applied per chunk: output = chunk template × this, aligned to the H3 canvas rule (32-px grid → even latent dims; e.g. 832x480 template × 1.5 → 1248x720 px output). Set the EmptyMiniMaxH3LatentAV to the LOW-RES generation size — the returned latent (and the decoded frames) is the upscaled size. 1.0 = no upscaling (warns).",
+                    }),
                 "fps": ("FLOAT", {
                     "default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
                     "tooltip": "Frames per second of the output. H3 is 24 fps native — the px↔audio time mapping is fixed (40 audio latent fps, temporal_shape), so any other value only triggers a warning and 24 is used.",
@@ -1048,6 +1241,9 @@ class CLSSH3StreamingSampler:
         image=None,
         vae=None,
         audio_vae=None,
+        refine_latent=None,
+        upscaler=None,
+        upscale_scale: float = 1.5,
         fps: float = 24.0,
         detail_anchor: str = "on",
         video_slb_tau_mult: float = 1.0,
@@ -1070,12 +1266,17 @@ class CLSSH3StreamingSampler:
         fps = float(_NATIVE_FPS)
 
         _s = sigmas.flatten().float().cpu()
-        if (_s.numel() < 2 or not (0.98 <= float(_s[0]) <= 1.02)
-                or float(_s[-1]) > 1e-4 or not bool((_s[:-1] >= _s[1:]).all())):
+        if (_s.numel() < 2 or not (0.0 < float(_s[0]) <= 1.02)
+                or float(_s[-1]) < -1e-6
+                or not bool((_s[:-1] >= _s[1:]).all())):
             raise ValueError(
                 "[CLSS] sigmas must be a monotonically decreasing flow schedule "
-                "from 1.0 to 0.0 (use BasicScheduler on the MiniMaxH3SigmaShift-"
-                f"patched model); got [0]={float(_s[0]):.6g} "
+                "within [0, 1] — ANY slice of the 1.0->0.0 schedule is accepted: "
+                "a low-res pass may END above 0 (its x0 estimate is then "
+                "upscaled) and a refine pass may START below 1.0 (e.g. 0.9035, "
+                "0.6316, 0.3158, 0.0 — connect refine_latent for that pass). "
+                "Build it with BasicScheduler / SplitSigmas / ManualSigmas on the "
+                f"MiniMaxH3SigmaShift-patched model; got [0]={float(_s[0]):.6g} "
                 f"[-1]={float(_s[-1]):.6g} len={_s.numel()}")
 
         if audio_refine_guider is not None and audio_recompose_steps <= 0:
@@ -1103,6 +1304,70 @@ class CLSSH3StreamingSampler:
                              f"the frame count to 17k+5 px")
         overlap = _snap_overlap(clss_config.overlap_latent_frames)
         new_cont = new_lf0 - 2
+
+        # Refine/hires base (optional): the previous pass's latent (typically
+        # after a neural latent upscale). Each chunk's window is seeded from the
+        # matching absolute slice — for chunk 0 the whole window, later chunks
+        # the whole window too, with the SLB overwriting the overlap region (the
+        # same precedence as a normal run). Flow noising then starts at
+        # sigma0*noise + (1-sigma0)*base (CONST.noise_scaling), which is why the
+        # schedule must start below 1.0 for the base to matter at all.
+        _refine_vid = _refine_aud = None
+        if refine_latent is not None:
+            _r_samples = refine_latent.get("samples")
+            if getattr(_r_samples, "is_nested", False):
+                _rt = _r_samples.unbind()
+                _refine_vid = _rt[0]
+                if len(_rt) > 1:
+                    _refine_aud = _rt[1]
+            else:
+                _refine_vid = _r_samples
+            if (getattr(_refine_vid, "ndim", 0) != 5 or _refine_vid.shape[0] != B
+                    or _refine_vid.shape[1] != C_v
+                    or tuple(_refine_vid.shape[3:]) != (H, W)):
+                raise ValueError(
+                    f"[CLSS] refine_latent video stream "
+                    f"{tuple(getattr(_refine_vid, 'shape', ()))} does not match "
+                    f"the chunk template (B={B}, C={C_v}, {H}x{W} latent grid) — "
+                    f"the refine latent must be at the SAME resolution as this "
+                    f"pass's EmptyMiniMaxH3LatentAV (upscale first, then refine "
+                    f"with a template upscaled to the same size).")
+            if _refine_aud is not None and (
+                    getattr(_refine_aud, "ndim", 0) != 4
+                    or _refine_aud.shape[0] != B_a or _refine_aud.shape[1] != C_a
+                    or _refine_aud.shape[2] != lanes_a):
+                print(f"[CLSS] WARNING: refine_latent audio stream "
+                      f"{tuple(getattr(_refine_aud, 'shape', ()))} does not match "
+                      f"the template ({B_a}, {C_a}, {lanes_a} lanes) — the audio "
+                      f"windows will start from noise.")
+                _refine_aud = None
+
+        # Optional per-chunk upscale: validate + resolve target dims here (the
+        # model itself moves onto the sampling device only when the run starts).
+        _ups = upscaler
+        if _ups is not None and not hasattr(_ups, "upscale"):
+            raise ValueError(
+                "[CLSS] upscaler must come from CLSSH3LoadLatentUpscaleModel "
+                f"(got {type(_ups).__name__})")
+        _up_scale = float(upscale_scale)
+        _up_active = _ups is not None and _up_scale > 1.0001
+        _up_w = _up_h = 0
+        _up_dev = None
+        if _up_active:
+            # 32-px canvas rule collapses to even latent dims (align 32 = 2*16)
+            _up_w = max(2, 2 * round(W * _up_scale / 2))
+            _up_h = max(2, 2 * round(H * _up_scale / 2))
+            # Compute device, NOT the latent's: dynamic VRAM loading keeps the
+            # AV latent template on CPU, and the upscaler must not run there.
+            _up_dev = comfy.model_management.get_torch_device()
+            if _up_w == W and _up_h == H:
+                _up_active = False
+                print(f"[CLSS] WARNING: upscale_scale={_up_scale:g} does not change "
+                      f"the {W}x{H} latent grid after 32-px alignment — upscaler "
+                      f"skipped for this run.")
+        elif _ups is not None:
+            print("[CLSS] WARNING: upscaler connected but upscale_scale <= 1.0 — "
+                  "no upscaling happens.")
 
         img_guide_latent: torch.Tensor | None = None
         if image is not None and vae is not None:
@@ -1153,6 +1418,33 @@ class CLSSH3StreamingSampler:
         _eff_num_chunks = len(chunk_plan)
         T_total, Ta_total = _t_acc, _a_acc
         Ta_ol = _af_of_px(px_ol)
+
+        _sigma0 = float(_s[0])
+        if _refine_vid is None and _sigma0 < 0.999:
+            print(f"[CLSS] WARNING: partial schedule (sigma0={_sigma0:.4f}) without "
+                  f"a refine_latent — every chunk starts from ~pure noise at "
+                  f"sigma0, i.e. a denoise-style partial generation, not a refine. "
+                  f"Connect the upscaled/previous-pass latent to seed the chunks.")
+        if _refine_vid is not None and _sigma0 > 0.999:
+            print(f"[CLSS] WARNING: refine_latent is connected but the schedule "
+                  f"starts at sigma0={_sigma0:.4f} — flow noising multiplies the "
+                  f"base by (1-sigma0)~0, so the base is effectively IGNORED. "
+                  f"Start the schedule below 1.0 (e.g. 0.9035, 0.6316, 0.3158, 0.0).")
+        if _refine_vid is not None:
+            _rv_t = int(_refine_vid.shape[2])
+            _ra_t = int(_refine_aud.shape[-1]) if _refine_aud is not None else 0
+            print(f"[CLSS] refine pass: chunks seeded from refine_latent "
+                  f"({_rv_t} video tok / {_ra_t} audio frames) at "
+                  f"sigma0={_sigma0:.4f} — base weight (1-sigma0)="
+                  f"{1.0 - _sigma0:.3f} per stream, SLB keeps the overlap.")
+            if _rv_t < T_total:
+                print(f"[CLSS] WARNING: refine_latent covers {_rv_t} video tokens "
+                      f"< this pass's {T_total} — the tail beyond it starts from "
+                      f"noise (did both passes use the same num_chunks/overlap?).")
+            if _refine_aud is not None and _ra_t < Ta_total:
+                print(f"[CLSS] WARNING: refine_latent audio covers {_ra_t} frames "
+                      f"< this pass's {Ta_total} — the tail beyond it starts from "
+                      f"noise.")
 
         pos_conds = guider.original_conds.get("positive", [])
         num_scenes = len(pos_conds)
@@ -1208,6 +1500,14 @@ class CLSSH3StreamingSampler:
               f"{getattr(guider, 'audio_cfg', '?')} rescale="
               f"{getattr(guider, '_rescale', '?')} | audio cfg "
               f"continuation chunks={audio_cfg_cont}")
+        if _up_active:
+            _up_note = (" [CPU — fp32 fallback, expect very slow]"
+                        if _up_dev.type == "cpu" else "")
+            print(f"[CLSS] upscaler: {getattr(_ups, 'name', '?')} x{_up_scale:g} "
+                  f"on {_up_dev} -> {_up_w * 16}x{_up_h * 16} px output (per chunk, "
+                  f"AFTER the SLB step; window + overlap in, overlap "
+                  f"crossfaded){_up_note}")
+            _ups.to_device(_up_dev)
         print("[CLSS] ================================================")
         _cond_plan: list = list(_scene_of)
         if num_scenes > 1 and scene_handoff != "hard":
@@ -1255,6 +1555,8 @@ class CLSSH3StreamingSampler:
         clss_state = CLSSState(clss_config)
         acc_video: list[torch.Tensor] = []
         acc_audio: list[torch.Tensor] = []
+        acc_video_hr: list[torch.Tensor] = []
+        _up_secs = 0.0
         audio_chunk_ends: list[int] = []
         _audio_tail: torch.Tensor | None = None
         _s1_prev_last: torch.Tensor | None = None
@@ -1287,6 +1589,7 @@ class CLSSH3StreamingSampler:
                    f"{audio_recompose_sigma:.2f}/p{audio_recompose_pool}"
                    f"s{audio_recompose_stride}"
                    if audio_recompose_steps > 0 else "")
+        _cfg_b = " seed=refine" if _refine_vid is not None else ""
         for chunk_idx in range(_eff_num_chunks):
             is_first = chunk_idx == 0
             _cur_new_lf, cur_new_af, _cur_new_px = chunk_plan[chunk_idx]
@@ -1363,6 +1666,15 @@ class CLSSH3StreamingSampler:
                 }
 
             lat_vid = torch.zeros(B, C_v, total_lf, H, W, device=device)
+            if _refine_vid is not None:
+                # seed the whole window from the base latent's absolute slice
+                # [_vid_pos - chunk_overlap, ...); the SLB block below then
+                # overwrites the overlap region, same precedence as a normal run.
+                _v0 = max(0, _vid_pos - chunk_overlap)
+                _v1 = min(_v0 + total_lf, int(_refine_vid.shape[2]))
+                if _v1 > _v0:
+                    lat_vid[:, :, :_v1 - _v0] = _refine_vid[:, :, _v0:_v1].to(
+                        device=device, dtype=lat_vid.dtype)
             mask_vid = torch.ones(1, 1, total_lf, 1, 1, device=device)
             if has_slb:
                 _tau_c_v = _tau_c_eff(clss_config.tau_c * video_slb_tau_mult,
@@ -1380,6 +1692,14 @@ class CLSSH3StreamingSampler:
                 _xf_n = min(round(audio_xfade_ms * AUDIO_LATENT_FPS / 1000.0),
                             _Ta_ol_w, acc_audio[-1].shape[-1])
             lat_aud = torch.zeros(B_a, C_a, lanes_a, chunk_af, device=device)
+            if _refine_aud is not None:
+                # audio window frames map to absolute [_aud_pos - _Ta_ol_w, ...)
+                # (same mapping _SlicedNoise uses for the new-region noise slice)
+                _a0 = max(0, _aud_pos - _Ta_ol_w)
+                _a1 = min(_a0 + chunk_af, int(_refine_aud.shape[-1]))
+                if _a1 > _a0:
+                    lat_aud[..., :_a1 - _a0] = _refine_aud[..., _a0:_a1].to(
+                        device=device, dtype=lat_aud.dtype)
             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
             if not is_first:
                 _cfg_a = "aud=free"
@@ -1391,14 +1711,14 @@ class CLSSH3StreamingSampler:
             if is_first:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}: win {_cur_new_px}px/{chunk_af}af "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}{_cfg_b}")
             else:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}"
                       f"{' (transition)' if _is_transition else ''}: "
                       f"win {px_ol + _cur_new_px}px/{chunk_af}af "
                       f"join_af={_Ta_ol_w} (round {_Ta_ol_w - Ta_ol:+d}) "
-                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}")
+                      f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_cfg_rc}{_cfg_b}")
             _chunk_noise = _SlicedNoise(
                 _full_noise_vid, _vid_pos, chunk_overlap, seed=_noise_seed,
                 full_noise_aud=_full_noise_aud,
@@ -1508,7 +1828,18 @@ class CLSSH3StreamingSampler:
                 _dt_rc = time.time() - _t_rc
                 aud_out = _rc_out["samples"].unbind()[1]
                 if audio_refine_guider is not None:
-                    comfy.model_management.unload_model(audio_refine_guider.inner_model)
+                    # Release the base recompose model (and its clones) from
+                    # VRAM after this chunk: it is a SEPARATE checkpoint from
+                    # the main turbo model, so both would otherwise stay
+                    # resident for the rest of the run. unload_model_and_clones
+                    # is the targeted ComfyUI API — unload_all_models here
+                    # would also evict the main model the next chunk needs.
+                    # Use guider.model_patcher (the PERSISTENT ModelPatcher set
+                    # in CFGGuider.__init__): guider.inner_model is the
+                    # transient loaded clone that outer_sample DELETES when the
+                    # sampling call returns, so it no longer exists here.
+                    comfy.model_management.unload_model_and_clones(
+                        audio_refine_guider.model_patcher)
                     comfy.model_management.soft_empty_cache()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1580,6 +1911,22 @@ class CLSSH3StreamingSampler:
 
             clss_state.update_buffer(corrected)
             acc_video.append(corrected.cpu())
+            if _up_active:
+                # Upscale this chunk AFTER its SLB step: the streaming state
+                # stays low-res; the full window (overlap + new) goes in for
+                # left temporal context, and the overlap span is crossfaded
+                # over the previous chunk's delivered tail so seams blend.
+                _t_up0 = time.time()
+                _up_in = torch.cat([vid_out[:, :, :chunk_overlap], corrected],
+                                   dim=2)
+                _up_hr = _ups.upscale(_up_in, _up_scale, device=_up_dev)
+                _dt_up = time.time() - _t_up0
+                _up_secs += _dt_up
+                print(f"[CLSS]   upscale {int(_up_in.shape[2])} tok -> "
+                      f"{_up_hr.shape[-1] * 16}x{_up_hr.shape[-2] * 16} px in "
+                      f"{_dt_up:.1f}s")
+                _blend_upscaled_overlap(acc_video_hr, _up_hr, chunk_overlap)
+                acc_video_hr.append(_up_hr[:, :, chunk_overlap:].cpu())
             _trend["vid_intra"].append(_frame_cos(corrected[:, :, 0], corrected[:, :, -1]))
             if _s1_prev_last is not None:
                 _trend["vid_bnd"].append(_frame_cos(_s1_prev_last.to(device), corrected[:, :, 0]))
@@ -1715,7 +2062,7 @@ class CLSSH3StreamingSampler:
                     _lv_prev = acc_audio[-1][..., -_Lw:].float().pow(2).mean().sqrt()
                     _lv_new = new_aud[..., :_Lw].float().pow(2).mean().sqrt()
                     _trend["aud_lvl"].append(
-                        20.0 * math.log10(float(_lv_new)
+                        20.0 * math.log10(max(float(_lv_new), 1e-12)
                                           / max(float(_lv_prev), 1e-8)))
                 _trend["aud_step"].append(_aud_seam_step(
                     acc_audio[-1], new_aud.cpu()))
@@ -1738,14 +2085,25 @@ class CLSSH3StreamingSampler:
             _vid_pos += _cur_new_lf
             _aud_pos += cur_new_af
 
-        full_vid = torch.cat(acc_video, dim=2)
+        if _up_active:
+            _n_up = len(acc_video_hr)
+            full_vid = torch.cat(acc_video_hr, dim=2)
+            acc_video.clear()
+        else:
+            full_vid = torch.cat(acc_video, dim=2)
         for _k, _v in _trend.items():
             if _v:
                 print(f"[CLSS] trend {_k}: " + " ".join(f"{_x:.3f}" for _x in _v))
+        if _up_active:
+            print(f"[CLSS] upscaler: {_n_up} chunk(s) upscaled in {_up_secs:.1f}s | "
+                  f"output video {tuple(full_vid.shape)} "
+                  f"({full_vid.shape[-1] * 16}x{full_vid.shape[-2] * 16} px)")
         full_aud = torch.cat(acc_audio, dim=-1)
         full_aud = _post_process_audio_latent(full_aud, audio_chunk_ends,
                                               energy_beta=0.0, label=" S1")
         output_samples = comfy.nested_tensor.NestedTensor((full_vid, full_aud))
+        if _ups is not None:
+            _ups.offload()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         if torch.cuda.is_available():
@@ -1842,6 +2200,7 @@ NODE_CLASS_MAPPINGS = {
     "CLSSH3SceneReference":   CLSSH3SceneReference,
     "CLSSH3SceneReferences":  CLSSH3SceneReferences,
     "CLSSH3SceneReferencesAll": CLSSH3SceneReferencesAll,
+    "CLSSH3LoadLatentUpscaleModel": CLSSH3LoadLatentUpscaleModel,
     "CLSSH3StreamingSampler": CLSSH3StreamingSampler,
     "CLSSH3Guider":           CLSSH3Guider,
     "CLSSH3VideoDecodeSave":  CLSSH3VideoDecodeSave,
@@ -1852,6 +2211,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",
     "CLSSH3SceneReferences":  "CLSS H3 Scene References (R2V multi)",
     "CLSSH3SceneReferencesAll": "CLSS H3 Scene References (R2V all scenes)",
+    "CLSSH3LoadLatentUpscaleModel": "CLSS H3 Load Latent Upscale Model",
     "CLSSH3StreamingSampler": "CLSS H3 Streaming Sampler",
     "CLSSH3Guider":           "CLSS H3 Guider (Split AV CFG)",
     "CLSSH3VideoDecodeSave":  "CLSS H3 Video Decode+Save (streaming)",

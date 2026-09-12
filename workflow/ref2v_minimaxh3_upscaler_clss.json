@@ -1,0 +1,371 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Video VAE (H3)"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Audio VAE (H3)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_hybrid_b20-49_pruned_w4a8_mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_int4_convrot.safetensors",
+      "type": "auto",
+      "projection": "mmh3-4b-ClipProj-v3.1-mlp.safetensors",
+      "device": "cuda:0",
+      "mode": "resident"
+    },
+    "class_type": "ClipProjLoader",
+    "_meta": {
+      "title": "ClipProj: 4B encoder + projection (replaces 15.7 GB 32B)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "prompts": "detailed_description:\n[Shot 1] 0–3s: Wide shot. <Subject 1> stands on a rain-slicked rooftop at night, city skyline behind her. She is center-frame, facing camera, hair blowing in wind. <Picture 1> is referenced as visual anchor. She is silent, mouth closed, no lip-sync.\n[Shot 2] 3–7s: Close-up on <Subject 1>'s face. She smirks, eyes catch neon reflections. No singing, no speaking.\n[Shot 3] 7–10s: Camera pulls back. She takes a slow step forward. Pink and blue neon signs flicker in background. Freeze on her confident stance.",
+      "global_text": "subject_definitions:\n<Subject 1> is the young girl in <Picture 1>, with blonde hair tied back with pink hair clips, blue eyes, light complexion, subtle blush. She wears a light grey zip-up hoodie with pink graphic text, white t-shirt with cartoon cat face, black jogger pants, white chunky sneakers, blue fingerless gloves with dark dots. Confident, mischievous smile.\n\n<Picture 1> is the full-body reference image, used as visual anchor for <Subject 1>'s appearance, clothing, and initial pose.\n\nsummary:\n[reference generation] A 10-second visual-only music video segment. <Subject 1> performs choreographed movement and action in a neon-lit urban night environment. She does NOT sing, does NOT speak, and has NO lip-sync. No vocals, no dialogue. Only visual performance, camera movement, and VFX synchronized to non-diegetic music.\n\nretention_analysis:\n<Picture 1> fully preserved as visual basis. <Subject 1>'s identity, outfit, facial features retained throughout. No singing, no speaking, no lip movement.\n\noverall_soundscape:\nUrban night ambience: distant traffic, soft rain, neon buzz, footsteps on wet surfaces.\n\nnon_diegetic_music:\nDriving synthwave electronic score, heavy bassline, arpeggiated synths, punchy four-on-the-floor beat, fast tempo. Intensity matches visual performance.",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (--- separated)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX",
+      "global_text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (negative)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "width": [
+        "43",
+        0
+      ],
+      "height": [
+        "44",
+        0
+      ],
+      "length": 243
+    },
+    "class_type": "EmptyMiniMaxH3LatentAV",
+    "_meta": {
+      "title": "Empty H3 AV Latent (per-chunk: 243 px ≈ 10.1 s)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSampler Select"
+    }
+  },
+  "9": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "65",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise_seed": 605729501891549
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "12": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "rescale": 0.7,
+      "model": [
+        "65",
+        0
+      ],
+      "positive": [
+        "62",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "CLSS H3 Guider (Split AV CFG)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "filename_prefix": "clss_h3/CLSSH3_frame_",
+      "frames_per_slice": 27,
+      "context_frames": 0,
+      "fps": 24,
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "78",
+        0
+      ]
+    },
+    "class_type": "CLSSH3VideoDecodeSave",
+    "_meta": {
+      "title": "CLSS H3 Video Decode+Save (streaming)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "filename_prefix": "audio/CLSSH3",
+      "format": "flac",
+      "audio": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save Audio"
+    }
+  },
+  "16": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "39",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "MiniMaxH3 Sigma Shift"
+    }
+  },
+  "23": {
+    "inputs": {
+      "tau_c": 0.05,
+      "beta": 0.4,
+      "overlap": 8
+    },
+    "class_type": "CLSSH3Config",
+    "_meta": {
+      "title": "CLSS H3 Config"
+    }
+  },
+  "36": {
+    "inputs": {
+      "image": "8f83de27-35dd-4fff-b220-863907d48318.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "39": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength": 1,
+      "low_vram": false,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo LoRA"
+    }
+  },
+  "43": {
+    "inputs": {
+      "value": 960
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "width"
+    }
+  },
+  "44": {
+    "inputs": {
+      "value": 544
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Height"
+    }
+  },
+  "62": {
+    "inputs": {
+      "ref_image_size": "match",
+      "audio_seconds_per_scene": 10,
+      "width": [
+        "43",
+        0
+      ],
+      "height": [
+        "44",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "36",
+        0
+      ]
+    },
+    "class_type": "CLSSH3SceneReferencesAll",
+    "_meta": {
+      "title": "CLSS H3 Scene References (R2V all scenes)"
+    }
+  },
+  "65": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "Model Attention Backend"
+    }
+  },
+  "77": {
+    "inputs": {
+      "model_name": "minimax_h3_bf16_CONSERVATIVE_v5.safetensors",
+      "precision": "bf16"
+    },
+    "class_type": "CLSSH3LoadLatentUpscaleModel",
+    "_meta": {
+      "title": "CLSS H3 Load Latent Upscale Model"
+    }
+  },
+  "78": {
+    "inputs": {
+      "num_chunks": 1,
+      "upscale_scale": 2,
+      "fps": 24,
+      "detail_anchor": "on",
+      "video_slb_tau_mult": 1,
+      "audio_guide_seconds": 0,
+      "audio_xfade_ms": 100,
+      "audio_refresh_waveform": "off",
+      "audio_head_discard_ms": 50,
+      "audio_cfg_cont": 1,
+      "audio_recompose_steps": 0,
+      "audio_recompose_sigma": 1,
+      "audio_recompose_pool": 2,
+      "audio_recompose_stride": 2,
+      "audio_recompose_seed": 0,
+      "scene_handoff": "hard",
+      "guider": [
+        "12",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "noise": [
+        "10",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ],
+      "clss_config": [
+        "23",
+        0
+      ],
+      "upscaler": [
+        "77",
+        0
+      ],
+      "sigmas_refine": [
+        "79",
+        0
+      ]
+    },
+    "class_type": "CLSSH3StreamingSampler",
+    "_meta": {
+      "title": "CLSS H3 Streaming Sampler (6 chunks ≈ 56 s)"
+    }
+  },
+  "79": {
+    "inputs": {
+      "sigmas": "0.9035, 0.6316, 0.3158, 0.0000"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "3 step Sigmas"
+    }
+  }
+}

@@ -42,6 +42,29 @@ The multi-ref node uses V3 Autogrow sockets (up to 9 images + 3 audios per scene
 
 **All scenes at once.** `CLSSH3SceneReferencesAll` removes the per-scene chain: every connected `ref_image` is attached to **all** scenes, and the connected `ref_audio` file(s) are concatenated and cut into consecutive windows, one per scene — scene *i* anchors on seconds `[i·T, (i+1)·T)` of the track ("10 s after 10 s"), `T = audio_seconds_per_scene` (default 10 s). Set `T` to the time one scene actually generates (chunks per scene × chunk length) so each scene is anchored to the musical/voice span it is producing. Scenes past the end of the track keep their image refs only; a warning prints which scenes lost their audio window. Change the `---` scene list and nothing needs rewiring — the canonical R2V workflow uses this node.
 
+## Upscaling (neural latent upscaler)
+
+Two ways to use [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) with CLSS. Both need that pack installed (CLSS **soft-imports** its 3D model module at execute time — nothing is vendored) and a checkpoint in `models/latent_upscale_models/`.
+
+### 1. Chunk-by-chunk upscale inside the sampler (recommended)
+
+`CLSSH3LoadLatentUpscaleModel` → `CLSSH3StreamingSampler.upscaler` + `upscale_scale`:
+
+- Every chunk is upscaled **right after its SLB step**, so the streaming state stays low-res and a long video never exists at high resolution all at once.
+- Each chunk's **full window** (SLB overlap + new tokens) is sent to the upscaler for left temporal context; the overlapping span is **cross-faded** over the previous chunk's delivered tail, so upscale seams blend instead of stepping.
+- The node returns high-res **video** + unchanged **audio** (the upscaler is spatial only; time is preserved). Set `EmptyMiniMaxH3LatentAV` to the **low-res** generation size — output = template × `upscale_scale`, aligned to the 32-px canvas rule (832×480 × 1.5 → 1248×720).
+- Costs ~0.7 GB extra VRAM for the upscaler (fp16) during the run; it is moved to the **compute device (CUDA)** at run start and offloaded afterwards. (Without CUDA it falls back to fp32 CPU inference, which is far too slow for this network — don't use it there.) Decoding the bigger latent needs more VRAM per slice — lower `frames_per_slice` in the decode node if needed.
+
+### 2. Two-pass refine (`refine_latent`)
+
+The hires pipeline with a second sampling pass, if you want the model (not just the network) to re-detail the upscaled latent:
+
+1. **Low-res pass** — `CLSSH3StreamingSampler` with the *high part* of the schedule (`BasicScheduler` → `SplitSigmas`, e.g. split at step 4). Its output is the model's x0 estimate at the split sigma (e.g. 0.9035) — soft, but complete.
+2. **Upscale** — separate the AV latent, run the video stream through the upscaler, then re-concat with the pass-1 audio (`LTXVConcatAVLatent`).
+3. **Refine pass** — `CLSSH3StreamingSampler` again at the target resolution with **`refine_latent` connected** and the *low part* of the schedule (e.g. `0.9035, 0.6316, 0.3158, 0.0000`). Each chunk is seeded from its slice of the upscaled latent, so flow noising starts at `σ0·noise + (1−σ0)·base` — the base keeps `1−σ0` of the start, so **start below 1.0 or the base is ignored** (the sampler warns). Alignment is positional, so reuse the low-res pass's `num_chunks` and overlap.
+
+Any slice of the 1.0→0.0 schedule is accepted by the sampler: one that ends above zero (upscale input), starts below 1.0 (refine), or both. A video-only `refine_latent` is fine — the audio windows then start from noise; a nested AV latent refines both streams.
+
 ## Model files
 
 From `Comfy-Org/MiniMax-H3` on Hugging Face:
@@ -83,7 +106,8 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 | **CLSS H3 Scene Reference (R2V)** | Attach one reference image and/or audio to one scene's conditioning (`<Picture N>` / `<Audio N>` labels) |
 | **CLSS H3 Scene References (R2V multi)** | All of one scene's refs in one node — V3 Autogrow sockets, up to 9 images + 3 audios, socket order = label order |
 | **CLSS H3 Scene References (R2V all scenes)** | One node for the whole scene list: every image attaches to all scenes, the ref audio is concatenated and cut into consecutive per-scene windows (10 s after 10 s, `audio_seconds_per_scene`); replaces the per-scene chain |
-| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, corrections, per-chunk telemetry + end-of-run trend summary |
+| **CLSS H3 Load Latent Upscale Model** | Loads a Minimax H3 latent-upscaler (3D) checkpoint from `models/latent_upscale_models` for the sampler's per-chunk upscale; the model code is soft-imported from the Comfyui_Minimax_h3_latent_Upscaler pack at execute time |
+| **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), two-pass hires refine (`refine_latent` + a partial schedule), corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
@@ -96,7 +120,7 @@ EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelec
 ## Repository layout
 
 ```
-nodes.py     # all 8 ComfyUI node implementations
+nodes.py     # all 9 ComfyUI node implementations
 clss.py      # the model-agnostic CLSS algorithm core (SLB, EMA/AdaIN, anchor bank)
 workflow/    # canonical t2v / R2V / turbo-LoRA workflows — copy them for experiments, don't mutate in place
 ```
@@ -109,6 +133,7 @@ Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL
 
 **2026-09-11 — all-scene refs, global prompt text, audio recompose + seam controls**
 
+- **Chunk-by-chunk upscaling inside the sampler** — `CLSSH3LoadLatentUpscaleModel` + the sampler's `upscaler` / `upscale_scale`: every chunk is upscaled **after its SLB step** (full window in, overlap cross-faded over the previous tail), so a long video never exists at high res at once — the per-chunk, memory-bounded version of [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). See [Upscaling](#upscaling-neural-latent-upscaler). The sampler also accepts **any slice** of the 1.0→0.0 flow schedule (end above zero for a low-res pass, start below 1.0 for a refine pass) and the optional `refine_latent` seeds every chunk from a previous (e.g. upscaled) latent for the two-pass hires path.
 - **All-scene R2V refs** — new `CLSSH3SceneReferencesAll` node: every `ref_image` attaches to ALL scenes, and the connected `ref_audio` file(s) are concatenated and cut into consecutive per-scene windows (`audio_seconds_per_scene`, default 10 s → "10 s after 10 s"). Replaces chaining one ref node per `---` block; [`t2v_with_ref_minimaxh3_clss.json`](workflow/t2v_with_ref_minimaxh3_clss.json) now uses it.
 - **`global_text` on `CLSSH3ScenePrompts`** — one text field copied to the top of every scene block before encoding, so shared style/section text is written once; the prefix is baked into each scene's text and survives the ref nodes' re-tokenization.
 - **Audio recompose** — `audio_recompose_steps` / `_sigma` / `_pool` / `_stride` / `_seed` + `audio_refine_guider`: per chunk, a fresh audio take from pure noise against the finished video (the measured fix for turbo-LoRA audio). New [`t2v_lora_minimaxh3_clss.json`](workflow/t2v_lora_minimaxh3_clss.json) ships the turbo-LoRA + base-model-recompose config.
