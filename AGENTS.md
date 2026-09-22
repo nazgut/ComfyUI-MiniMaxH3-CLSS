@@ -16,16 +16,29 @@ overlap, keeping latent memory O(overlap) instead of O(length). Between chunks i
 closed-loop corrections that fight exposure-bias drift **without modifying transformer
 weights**:
 
-- **§2.1** calibrated context re-noising (`tau_c`, default 0.05; per-chunk schedule rises
+- **Calibrated context re-noising** (`tau_c`, default 0.05; per-chunk schedule rises
   toward a 0.10 ceiling with a 5-chunk half-life) — on H3 implemented via per-token
   denoise masks (mask m → per-row sigma m·σ, `comfy/ldm/minimax/model.py` `_forward`)
-- **§2.3** EMA-tracked per-channel AdaIN drift correction (`beta`, default 0.4; the EMA
-  reference resets at every scene change via `CLSSState.reset_drift_refs`)
-- **§2.5** dynamic anchor bank — on H3 the top-m anchors are pinned as
-  `minimax_keyframes` conditioning rows at `resolved_frame_index=0` of the chunk window
-  (the LTX version tracked the bank for telemetry only; H3's keyframe-row mechanism is
-  what makes real anchor conditioning expressible)
-- Two-band spatial detail anchor; audio SLB seam modes (see `audio_slb_tau_mult` below)
+- **EMA-tracked per-channel AdaIN drift correction** (`beta`, default 0.4) with an
+  anchored, capped mean (`ema_mean_max`); the EMA reference resets at every scene
+  change via `CLSSState.reset_drift_refs`
+- **Keyframe context replay** — the previous chunk's context rows ride as
+  `minimax_keyframes` conditioning rows at their pixel times (Motion Director
+  mechanism); the VIDEO span is additionally seeded in the latent and re-noised
+  at τc. The AUDIO window head stays FREE — only the end-anchored
+  `minimax_refs` audio ref carries the tail (MD parity since 2026-09-16; the
+  old τ_a in-stream seed is deleted). With the sampler's optional `audio_vae`
+  input wired, that ref is REFRESHED AT EVERY BOUNDARY from the delivered tail
+  re-encoded in the export (audible) domain — MD `audio_context_refresh`
+  normal path; the delivered latent slice is the strict fallback (MD
+  `_waveform_can_refresh`; the per-chunk log marks the source `(wav)`/`(lat)`).
+  All workflow JSONs carry the wiring. OWNER DIRECTIVE 2026-09-18: "no tail
+  in audio when there is a ref" — on chunks whose scene carries its OWN
+  audio reference (`<Audio j>` R2V block) the tail ref is NOT attached at
+  all (`audref=off(scene ref)` in the chunk log); those scenes take their
+  audio FROM the reference. The VIDEO continuation — keyframe replay + SLB
+  seed — runs its overlap everywhere, refs or not.
+- Two-band spatial detail anchor (`detail_anchor` input)
 
 ## H3 architecture facts that shape the code
 
@@ -68,27 +81,71 @@ nodes.py     # all 9 ComfyUI node implementations (incl. R2V scene-reference nod
              # CLSSH3SceneReference single + CLSSH3SceneReferences V3-Autogrow multi,
              # re-tokenizing one scene's text with minimax_ref_items so <Picture N>/
              # <Audio N> labels bind per scene; CLSSH3SceneReferencesAll applies
-             # images to every scene and auto-slices ref audio into per-scene
-             # windows — scene i gets seconds [i*T, (i+1)*T), T =
-             # audio_seconds_per_scene, via _ref_audio_window_bounds; and
+             # images to every scene and encodes ref audio into per-scene GUARDED
+             # windows (±4 s band) — the sampler re-cuts each to the piece's
+             # scene span PLUS the window lead-in, at run start, by CROPPING the
+             # guard (PRESENTATION LEAD-IN, 2026-09-18: H3 presents a scene's
+             # <Audio j> ref from the ref's own beginning == the window's start
+             # while delivery begins one overlap later — the window starts
+             # FRAME_RESCALE·px_ol af early (0 for the piece's first scene);
+             # without it the first ~0.92 s of every continuation scene was
+             # swallowed — measured +916.7/+925 ms shifts, NCC 0.91 at the
+             # offset vs 0.02 aligned; crops 405/434/433 af on the 3×243px plan)
+             # (_recut_scene_audio_windows + _scene_grid_window_bounds, from its
+             # own chunk plan + scene allocation; nothing to wire on the sampler
+             # side, nothing to enter by hand). A span outside the guard falls
+             # back to a re-encode (needs the sampler's audio_vae) and is logged
+             # otherwise — the old exact-T cut slid ~83 ms per chunk against the
+             # 17k+5 grid (the sampler warns when window af lengths do not match
+             # its scene spans + lead-in; sim/sim_ref_window_drift.py); and
+             # REF MERGE ORDER CONTRACT (2026-09-18): the sampler's continuation
+             # tail ref is APPENDED LAST to minimax_refs, after the scene's own
+             # blocks. Upstream binds <Picture i>/<Audio j> ordinals BY ORDER
+             # among same-kind blocks, so prepending the tail stole the scene's
+             # <Audio 1> slot — the previous tail got re-presented in the next
+             # chunk and the scene refs stopped binding after chunk 1 (measured:
+             # chunk1 NCC 0.90 vs the track, chunks 2/3 ~0). MD parity
+             # (motion_context.py: existing_refs + [block]);
+             # guard: sim/sim_ref_order.py. NEVER prepend a ref. AND the tail
+             # ref is attached ONLY on chunks whose scene has NO audio ref
+             # (owner directive 2026-09-18) — ref'd scenes take their audio
+             # from <Audio j>; the video continuation is unaffected.
              # CLSSH3LoadLatentUpscaleModel + the sampler's per-chunk upscaler,
              # which SOFT-IMPORT their model module by file path at execute time
              # from sibling custom_nodes/*/nodes/minimax_h3_latent_upscaler_3d.py
              # — nothing vendored, no import-time code loading)
-clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, §2.3 EMA/AdaIN,
-             # §2.5 anchor bank, post_process, reset_drift_refs) — no ltx imports
+clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, EMA/AdaIN
+             # drift correction, post_process, reset_drift_refs) — no ltx imports
 __init__.py  # node-mapping exports only
-workflow/    # canonical workflows: t2v_minimaxh3_clss.json + t2v_with_ref_minimaxh3_clss.json
-             # + t2v_lora_minimaxh3_clss.json (turbo-LoRA + base-model audio recompose)
-             # (API format). RULE: every experiment copies the canonical file — never
-             # mutate it in place.
+workflow/    # canonical workflows (API format): t2v_minimaxh3_clss.json (text-to-video),
+             # i2v_minimaxh3_clss.json (first-frame guide via the sampler's image/vae
+             # inputs) and ref2v_minimaxh3_clss.json (CLSSH3SceneReferencesAll R2V refs)
+             # — all on the validated stack: 832x480, 243 px windows, 10 chunks,
+             # 20 steps, shift 12/6, audio_cfg 4, tail_margin 12, audio_config wired.
+             # The audio-lab files are generated on demand: sim/make_audio_lab.py
+             # writes workflow/audio_lab_minimaxh3_clss.json (driver: t2v).
+             # RULE: every experiment copies the canonical file — never mutate it in place.
+sim/         # offline harnesses (no model): sim_tau_c, sim_geometry, sim_mean_drift,
+             # sim_splice, sim_audio_refresh, sim_ref_window_drift
+             # (per-scene ref-audio windows vs the piece's scene grid) +
+             # sim_video_ref_span (Motion Video Context: a strided recompose video
+             # ref must sit on the target time grid — nodes._mc_fixup_video) +
+             # sim_loop_guard (a recompose take that measures as a self-repeating
+             # vamp is re-rolled with the next seed — _take_loop_metrics,
+             # _loop_guard_bad/_pick, _rc_seed_for) +
+             # sim_audio_continuity (CLSSH3ScenePrompts.audio_continuity_text:
+             # off-path byte-identity, dual-encode + _apply_scene_cont swap
+             # gated on chunk 0 / ref'd scenes; make_audio_lab --continuity-text) +
+             # audio_forensics.py (FLAC analyzer: loop/dulling/join metrics) +
+             # audio_repeat_scan.py (waveform repeat scan: exact period/NCC/reldiff) +
+             # make_audio_lab.py -> audio_lab workflow (see sim/AUDIO_LAB.md)
 ```
 
 ### Relationship to the LTX repo
 
 The LTX repo owns the LTX-2.3 implementation and its own `Ltx-2-CLSS` submodule. This
 repo's `clss.py` was vendored from that submodule (LTX-specific conditioning methods
-removed, `overlap_latent`/`top_anchors` accessors added). If the algorithm core changes
+removed; the `overlap_latent` accessor added). If the algorithm core changes
 materially, port the change both ways by hand — there is no shared dependency.
 
 ## The nodes and how they wire together
@@ -97,8 +154,14 @@ materially, port the change both ways by hand — there is no shared dependency.
 UNETLoader / ClipProjLoader (Qwen3-VL-4B + projection) / VAELoader×2 (video int8, audio bf16)
 CLSSH3ScenePrompts(CLIP, prompts)          → CONDITIONING (one entry per scene, '---' split;
                                              optional global_text copied to the TOP of every
-                                             scene block before encoding; used twice:
-                                             positive scenes + negative)
+                                             scene block before encoding; optional
+                                             audio_continuity_text encoded as a SECOND text
+                                             variant per scene ('clss_cont') and swapped in
+                                             ONLY on chunks carrying the continuation tail
+                                             ref (never the run's first chunk; _apply_scene_
+                                             cont, owner directive 2026-09-21); test branch
+                                             experiment/audio-continuity, default empty =
+                                             off; used twice: positive + negative)
 CLSSH3Guider(model, pos, neg, video_cfg 1.0, audio_cfg 1.0, rescale 0.7) → GUIDER
                                              # H3 is CFG-distilled — live A/B measured 4.0/7.0
                                              # corrupting output into oversaturated glitch frames;
@@ -106,6 +169,12 @@ CLSSH3Guider(model, pos, neg, video_cfg 1.0, audio_cfg 1.0, rescale 0.7) → GUI
 MiniMaxH3SigmaShift (stock, 12.0/6.0)      → MODEL (feeds guider + scheduler)
 EmptyMiniMaxH3LatentAV (stock)             → LATENT (per-chunk AV template, 5k+2 grid)
 CLSSH3Config                               → CLSS_CONFIG
+CLSSH3AudioConfig                          → CLSS_AUDIO_CONFIG (ALL audio settings:
+                                             recompose steps/sigma/arc margin/pool/stride/
+                                             seed/ref span, head discard + the loop guard &
+                                             rescue ref span; wire into the sampler's
+                                             `audio_config` — the sampler's own audio_*
+                                             widgets were removed 2026-09-20)
 CLSSH3LoadLatentUpscaleModel               → LATENT_UPSCALER (optional; soft-imports
                                              the sibling upscaler pack's 3D module)
 KSamplerSelect + BasicScheduler + RandomNoise → SAMPLER / SIGMAS / NOISE
@@ -139,18 +208,65 @@ schedule — a low-res pass may end above 0 (its x0 is then what the upscaler
 carries), and a partial schedule may start below 1.0 (every chunk then starts
 from noise at σ0).
 
+**Sample-exact audio seams:** the sampler cuts each delivered slice at
+floor(px_ol·5/3) audio tokens (22 px → 36 af, while the exact boundary is
+36.667 af) and records the junction geometry in the latent
+(`clss_audio_splice`). `CLSSH3VideoDecodeSave` rebuilds the waveform from it —
+drops the duplicated head samples, moves the next slice's shortfall fill
+across the junction, zero-pads ≤ 1 audio step at the tail — so joins are
+sample-contiguous (the old whole-token cut carried a 16.7 ms duplicate/skip
+at EVERY seam; `sim/sim_splice.py` verifies, `_splice_delivered_audio`).
+Junctions fall back to the plain append when the head is discarded
+(`audio_head_discard_ms`) or the window is degenerate. The seam carries
+NOTHING else — Motion Director parity (2026-09-16): no junction lead, no
+handoff fade, no join glide, no attack tame, no chunk level
+match (all removed; MD's seam is an exact trim + plain `torch.cat` and its
+ref ends exactly at the join in both content and row placement — see the
+SEAM DOCTRINE note in `nodes.py`). ONE measured exception: each junction is
+a take-swap CROSSFADE over the h−f samples both takes re-rendered (8–17 ms)
+— the hard swap measured 0.16–0.24 amplitude (4–5× the local median |diff|)
+in lab_00032, an audible click; a CONTENT fix (both sides are the same
+wall-clock render), never a gain. The decode stage applies ZERO level/dB
+processing (owner directive 2026-09-17: "we should not manipulate audio at
+all in correcting db"): the junction-anchored level matcher and its 6 dB
+content gate were deleted after the matcher measured ducking the owner's
+ref track's own section change by −16.7 dB (CLSSH3_00002) — the only
+remaining gain touch in the audio path is the headroom guard (whole-file
+attenuation only when the take would hard-clip the 16-bit FLAC).
+`audio_xfade_ms` / `audio_join_lead_ms`
+are deprecated + ignored so old workflow JSONs still load.
+
+**Tail margin (`tail_margin_px`, default 12):** MD generates every segment on
+the 17k+5 grid UP from `target+context` and EXPORTS only `[context,
+context+target)` — the 1-16 px alignment surplus is generated and discarded
+(their 124-px default segment discards 12 px; a 10-s segment, 15 px). The
+discarded zone is where each take's end-of-generation wind-down sits — the
+measured 150-250 ms quiet dip at the window end of our files — and MD's next
+ref ends at the EXPORTED end, so the dip never enters the chain. Our windows
+are grid-exact (238+22=260 px), surplus 0, so we delivered the dip into every
+seam (measured -10/-12 dB joins). With the margin > 0 every chunk GENERATES N
+px past its delivery end (token run on the (1,4,4,4,4) pattern; 12 -> 4 tokens
+= 13 px = 22 af) and delivers only up to it; the SLB (`update_buffer` gets
+`corrected` = the delivered slice), the next chunk's keyframes, the audio tail
+ref, the decode splice (`delivered_af`) and the assembled latent all see the
+PRE-margin material — MD's discarded surplus, made deterministic. The soft
+12-s window cap counts the margin; `0` restores the old behaviour.
+
 `scene_handoff`: `transition_chunk` (default) = two-step crossfade straddling each
 boundary (outgoing block's last chunk 25%-incoming, incoming block's first chunk
 75%-incoming; needs every scene block ≥2 chunks, i.e. `num_chunks ≥ 2×scenes`);
 `blend` = single 50/50 chunk; `hard` = plain text swap. EMA/refs reset on the first
 incoming-leaning chunk.
 
-Notable sampler knobs (defaults are the starting config, NOT yet live-validated on H3):
-`detail_anchor` on; `video_slb_tau_mult` 1.0; `audio_slb_tau_mult` 0.0 (0 = audio SLB
-frozen; >0 = re-noised, ceiling 0.35; <0 = overlap free except the last |value| SECONDS
-of the previous tail pinned at mask 0 at the end of the overlap — keeps vocal phrases
-glued across the seam); `fps` forced to 24 with a warning (the 40-latent-fps audio math
-is hard-wired to 24).
+Audio settings live on `CLSSH3AudioConfig` since 2026-09-20 (recompose
+steps/sigma/arc margin/pool/stride/seed/ref span, head discard, and the loop
+guard: `loop_guard_rerolls` 2 / `loop_guard_wc` 0.99 / `loop_guard_loop` 0.70
+/ `loop_guard_retry_ref_ms` 2000 — the ear-validated rescue config; see
+JUSTIFICATION §26 + §27). Notable remaining sampler knobs: `detail_anchor` on
+(the two-band band-energy anchor);
+`tail_margin_px` 12 (generated-but-not-delivered window tail, MD surplus
+parity — see above); `fps`
+forced to 24 with a warning (the 40-latent-fps audio math is hard-wired to 24).
 
 ## Build, run, and test commands
 
@@ -174,7 +290,7 @@ is hard-wired to 24).
 - **The denoising/generation path is high-risk.** Never ship a change to the chunk loop,
   mask construction, or correction math without a user-validated live run. Noise edits
   are only seed-safe if they preserve the exact N(0,1) marginal.
-- Tooltips on every input; heavy docstrings citing §-sections and measured evidence;
+- Tooltips on every input; heavy docstrings citing measured evidence;
   every non-obvious constant carries its justification.
 
 ## Security considerations

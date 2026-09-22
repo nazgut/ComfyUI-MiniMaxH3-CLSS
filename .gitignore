@@ -30,3 +30,9 @@ Thumbs.db
 
 # Logs / outputs
 *.log
+
+# Local-only docs, harnesses and scratch (not part of the repo)
+AGENTS.md
+JUSTIFICATION.md
+sim/
+tmp/

@@ -5,7 +5,7 @@
     },
     "class_type": "VAELoader",
     "_meta": {
-      "title": "Load Video VAE (H3)"
+      "title": "Video VAE (H3) - decode/save + i2v/ref encodes"
     }
   },
   "2": {
@@ -14,7 +14,7 @@
     },
     "class_type": "VAELoader",
     "_meta": {
-      "title": "Load Audio VAE (H3)"
+      "title": "Audio VAE (H3)"
     }
   },
   "3": {
@@ -24,7 +24,7 @@
     },
     "class_type": "UNETLoader",
     "_meta": {
-      "title": "Load Diffusion Model"
+      "title": "Diffusion model (H3 int8 convrot)"
     }
   },
   "4": {
@@ -37,7 +37,7 @@
     },
     "class_type": "ClipProjLoader",
     "_meta": {
-      "title": "ClipProj: 4B encoder + projection (replaces 15.7 GB 32B)"
+      "title": "Text encoder (ClipProj Qwen3-VL-4B + projection)"
     }
   },
   "5": {
@@ -51,7 +51,7 @@
     },
     "class_type": "CLSSH3ScenePrompts",
     "_meta": {
-      "title": "CLSS H3 Scene Prompts (--- separated)"
+      "title": "Scene prompts (positive; <Picture N>/<Audio N> bind to the R2V refs)"
     }
   },
   "6": {
@@ -65,24 +65,18 @@
     },
     "class_type": "CLSSH3ScenePrompts",
     "_meta": {
-      "title": "CLSS H3 Scene Prompts (negative)"
+      "title": "Scene prompts (negative)"
     }
   },
   "7": {
     "inputs": {
-      "width": [
-        "43",
-        0
-      ],
-      "height": [
-        "44",
-        0
-      ],
+      "width": 832,
+      "height": 480,
       "length": 243
     },
     "class_type": "EmptyMiniMaxH3LatentAV",
     "_meta": {
-      "title": "Empty H3 AV Latent (per-chunk: 243 px ≈ 10.1 s)"
+      "title": "Per-chunk template: 832x480, 243 px ~ 10.1 s"
     }
   },
   "8": {
@@ -91,22 +85,22 @@
     },
     "class_type": "KSamplerSelect",
     "_meta": {
-      "title": "KSampler Select"
+      "title": "Sampler"
     }
   },
   "9": {
     "inputs": {
       "scheduler": "simple",
-      "steps": 6,
+      "steps": 20,
       "denoise": 1,
       "model": [
-        "65",
+        "16",
         0
       ]
     },
     "class_type": "BasicScheduler",
     "_meta": {
-      "title": "BasicScheduler"
+      "title": "Schedule (20 steps, sigma shift 12/6)"
     }
   },
   "10": {
@@ -115,20 +109,20 @@
     },
     "class_type": "RandomNoise",
     "_meta": {
-      "title": "RandomNoise"
+      "title": "Noise seed"
     }
   },
   "12": {
     "inputs": {
       "video_cfg": 1,
-      "audio_cfg": 1,
+      "audio_cfg": 4,
       "rescale": 0.7,
       "model": [
-        "65",
+        "16",
         0
       ],
       "positive": [
-        "62",
+        "41",
         0
       ],
       "negative": [
@@ -138,12 +132,12 @@
     },
     "class_type": "CLSSH3Guider",
     "_meta": {
-      "title": "CLSS H3 Guider (Split AV CFG)"
+      "title": "Guider (video CFG off, audio CFG 4, rescale 0.7)"
     }
   },
   "14": {
     "inputs": {
-      "filename_prefix": "clss_h3/CLSSH3_frame_",
+      "filename_prefix": "clss_h3/ref2v/CLSSH3_frame_",
       "frames_per_slice": 27,
       "context_frames": 0,
       "fps": 24,
@@ -156,18 +150,18 @@
         0
       ],
       "latent": [
-        "78",
+        "30",
         0
       ]
     },
     "class_type": "CLSSH3VideoDecodeSave",
     "_meta": {
-      "title": "CLSS H3 Video Decode+Save (streaming)"
+      "title": "Decode + save video frames"
     }
   },
   "15": {
     "inputs": {
-      "filename_prefix": "audio/CLSSH3",
+      "filename_prefix": "audio/ref2v/CLSSH3",
       "format": "flac",
       "audio": [
         "14",
@@ -176,7 +170,7 @@
     },
     "class_type": "SaveAudioAdvanced",
     "_meta": {
-      "title": "Save Audio"
+      "title": "Save audio (FLAC)"
     }
   },
   "16": {
@@ -184,141 +178,34 @@
       "shift_video": 12,
       "shift_audio": 6,
       "model": [
-        "39",
+        "3",
         0
       ]
     },
     "class_type": "MiniMaxH3SigmaShift",
     "_meta": {
-      "title": "MiniMaxH3 Sigma Shift"
+      "title": "Sigma shift 12/6"
     }
   },
   "23": {
     "inputs": {
       "tau_c": 0.05,
       "beta": 0.4,
-      "overlap": 8
+      "overlap": 7,
+      "ema_mean_max": 0.25
     },
     "class_type": "CLSSH3Config",
     "_meta": {
-      "title": "CLSS H3 Config"
+      "title": "CLSS config (tau_c / beta / overlap / mean anchor)"
     }
   },
-  "36": {
+  "30": {
     "inputs": {
-      "image": "8f83de27-35dd-4fff-b220-863907d48318.png"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "Load Image"
-    }
-  },
-  "39": {
-    "inputs": {
-      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
-      "strength": 1,
-      "low_vram": false,
-      "model": [
-        "3",
-        0
-      ]
-    },
-    "class_type": "MiniMaxH3TurboLoRA",
-    "_meta": {
-      "title": "MiniMax-H3 Turbo LoRA"
-    }
-  },
-  "43": {
-    "inputs": {
-      "value": 960
-    },
-    "class_type": "PrimitiveInt",
-    "_meta": {
-      "title": "width"
-    }
-  },
-  "44": {
-    "inputs": {
-      "value": 544
-    },
-    "class_type": "PrimitiveInt",
-    "_meta": {
-      "title": "Height"
-    }
-  },
-  "62": {
-    "inputs": {
-      "ref_image_size": "match",
-      "audio_seconds_per_scene": 10,
-      "width": [
-        "43",
-        0
-      ],
-      "height": [
-        "44",
-        0
-      ],
-      "conditioning": [
-        "5",
-        0
-      ],
-      "clip": [
-        "4",
-        0
-      ],
-      "vae": [
-        "1",
-        0
-      ],
-      "ref_images.ref_image_0": [
-        "36",
-        0
-      ]
-    },
-    "class_type": "CLSSH3SceneReferencesAll",
-    "_meta": {
-      "title": "CLSS H3 Scene References (R2V all scenes)"
-    }
-  },
-  "65": {
-    "inputs": {
-      "attention": "comfy kitchen attention",
-      "model": [
-        "16",
-        0
-      ]
-    },
-    "class_type": "ModelAttentionBackend",
-    "_meta": {
-      "title": "Model Attention Backend"
-    }
-  },
-  "77": {
-    "inputs": {
-      "model_name": "minimax_h3_bf16_CONSERVATIVE_v5.safetensors",
-      "precision": "bf16"
-    },
-    "class_type": "CLSSH3LoadLatentUpscaleModel",
-    "_meta": {
-      "title": "CLSS H3 Load Latent Upscale Model"
-    }
-  },
-  "78": {
-    "inputs": {
-      "num_chunks": 1,
-      "upscale_scale": 2,
+      "num_chunks": 10,
       "fps": 24,
       "detail_anchor": "on",
-      "video_slb_tau_mult": 1,
-      "audio_guide_seconds": 0,
-      "audio_xfade_ms": 100,
-      "audio_head_discard_ms": 50,
-      "audio_recompose_steps": 0,
-      "audio_recompose_sigma": 1,
-      "audio_recompose_pool": 2,
-      "audio_recompose_stride": 2,
-      "audio_recompose_seed": 0,
       "scene_handoff": "hard",
+      "tail_margin_px": 12,
       "guider": [
         "12",
         0
@@ -343,14 +230,75 @@
         "23",
         0
       ],
-      "upscaler": [
-        "77",
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "audio_config": [
+        "31",
         0
       ]
     },
     "class_type": "CLSSH3StreamingSampler",
     "_meta": {
-      "title": "CLSS H3 Streaming Sampler (6 chunks ≈ 56 s)"
+      "title": "CLSS H3 Streaming Sampler (10 chunks ~ 99 s, R2V refs on every chunk)"
+    }
+  },
+  "31": {
+    "inputs": {
+      "audio_recompose_steps": 0,
+      "audio_recompose_sigma": 1,
+      "audio_arc_margin_ms": 4000,
+      "audio_recompose_pool": 2,
+      "audio_recompose_stride": 2,
+      "audio_recompose_seed": 0,
+      "audio_recompose_ref_ms": 0,
+      "audio_head_discard_ms": 0,
+      "loop_guard_rerolls": 2,
+      "loop_guard_wc": 0.99,
+      "loop_guard_loop": 0.7,
+      "loop_guard_retry_ref_ms": 2000
+    },
+    "class_type": "CLSSH3AudioConfig",
+    "_meta": {
+      "title": "Audio settings (recompose off; defaults = production)"
+    }
+  },
+  "40": {
+    "inputs": {
+      "image": "8f83de27-35dd-4fff-b220-863907d48318.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Reference image -> <Picture 1> (identity/style anchor)"
+    }
+  },
+  "41": {
+    "inputs": {
+      "ref_image_size": "match",
+      "width": 832,
+      "height": 480,
+      "audio_seconds_per_scene": 10,
+      "conditioning": [
+        "5",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "40",
+        0
+      ]
+    },
+    "class_type": "CLSSH3SceneReferencesAll",
+    "_meta": {
+      "title": "R2V refs: every image -> ALL scenes; ref audio auto-slices per scene"
     }
   }
 }

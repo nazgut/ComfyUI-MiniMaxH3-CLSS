@@ -42,7 +42,7 @@
   },
   "5": {
     "inputs": {
-      "prompts": "subject_definitions:\n<Driver> is a tanned middle-aged man; only his forearms and black-leather-gloved hands are visible, gripping the steering wheel at ten and two.\n<Ferrari> is a classic red vintage convertible with a glossy long hood, chrome grille and a chrome hood emblem, black leather interior and a white-gauged dashboard.\n<Coast> is a winding Pacific Coast highway: deep blue ocean with whitecaps and scattered rocks to the right, dry golden-brown hills with green coastal scrub to the left.\n\nsummary:\nA single continuous first-person driving shot from the driver's seat. No cuts, no transitions - one slow, smooth take. The <Ferrari> glides through a gentle right-hand curve, then the road straightens toward a hazy coastal plain.\n\ndetailed_description:\nCinematic live action, shot on 35mm film, golden hour late-afternoon light, fine natural grain. Warm orange and yellow glare pours through the windshield across polished chrome and leather; long shadows stretch from the front wheels. Fixed, eye-level POV camera mounted just behind the steering wheel, looking straight ahead over the hood, framing the road's center line.\n\n[Shot 1] 00:00.000-00:10.000. Fixed POV over the hood. The <Ferrari> enters a gentle right-hand curve; the steering wheel rotates subtly in the <Driver>'s gloved hands, fingers tapping rhythmically. Whitecaps break on the <Coast>'s offshore rocks to the right while golden hills slide past on the left. As the road straightens, the wheel returns to center and the chrome hood emblem aligns with the vanishing point, where cliffs recede into a low hazy plain.\n\noverall_soundscape:\nDiegetic only, continuous. A classic 90s rock song plays from the car radio in high quality, no artifacts, no noise; under it the smooth hum of the V12 engine and soft wind buffeting the windshield frame.\n\nnon_diegetic_music:\nN/A - no score; the only music is the diegetic car radio described above.\n",
+      "prompts": "subject_definitions:\n<Girl> is the young cartoon girl in the opening frame: blonde hair tied back with a pink clip, big blue eyes and a light blush, light grey zip-up hoodie with pink graphic text, white t-shirt with a cartoon cat face, black jogger pants, blue fingerless gloves with dark dots, white chunky sneakers. Confident, mischievous smile.\n\nsummary:\nA single continuous take, no cuts. The video opens on the exact presented first frame and comes to life: <Girl> performs a playful choreographed routine in the room, then the camera settles on her final pose. She does NOT sing, does NOT speak, and has NO lip-sync - her mouth stays closed.\n\ndetailed_description:\nCinematic stylized 3D animation, soft window light, gentle warm rim light, clean grey wall and wooden floor matching the first frame. Eye-level camera, slow orbit around <Girl>.\n\n[Shot 1] 00:00.000-00:10.000. The video starts on the exact first frame - <Girl> standing centre-frame on the wooden floor - and she springs into motion: hip pops, a quick spin, a point at the camera, hair and hoodie following every move. The camera orbits her slowly and settles as she lands on a confident final pose, chin up, one fingerless-gloved hand on her hip.\n\noverall_soundscape:\nQuiet room tone, soft footfalls and sneaker squeaks on the wooden floor, faint fabric rustle; no dialogue.\n\nnon_diegetic_music:\nDriving synthwave electronic score: heavy bassline, arpeggiated synths, punchy four-on-the-floor beat, fast tempo. Intensity matches her performance.",
       "clip": [
         "4",
         0
@@ -50,7 +50,7 @@
     },
     "class_type": "CLSSH3ScenePrompts",
     "_meta": {
-      "title": "Scene prompts (positive; '---' separates scenes)"
+      "title": "Scene prompts (positive; describes the take from the first frame)"
     }
   },
   "6": {
@@ -135,7 +135,7 @@
   },
   "14": {
     "inputs": {
-      "filename_prefix": "clss_h3/t2v/CLSSH3_frame_",
+      "filename_prefix": "clss_h3/i2v/CLSSH3_frame_",
       "frames_per_slice": 27,
       "context_frames": 0,
       "fps": 24,
@@ -159,7 +159,7 @@
   },
   "15": {
     "inputs": {
-      "filename_prefix": "audio/t2v/CLSSH3",
+      "filename_prefix": "audio/i2v/CLSSH3",
       "format": "flac",
       "audio": [
         "14",
@@ -235,11 +235,19 @@
       "audio_config": [
         "31",
         0
+      ],
+      "image": [
+        "40",
+        0
+      ],
+      "vae": [
+        "1",
+        0
       ]
     },
     "class_type": "CLSSH3StreamingSampler",
     "_meta": {
-      "title": "CLSS H3 Streaming Sampler (10 chunks ~ 99 s)"
+      "title": "CLSS H3 Streaming Sampler (10 chunks ~ 99 s, i2v first-frame guide)"
     }
   },
   "31": {
@@ -260,6 +268,15 @@
     "class_type": "CLSSH3AudioConfig",
     "_meta": {
       "title": "Audio settings (recompose off; defaults = production)"
+    }
+  },
+  "40": {
+    "inputs": {
+      "image": "8f83de27-35dd-4fff-b220-863907d48318.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "First-frame guide (i2v) - swap in your image"
     }
   }
 }
