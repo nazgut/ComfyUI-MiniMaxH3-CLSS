@@ -65,6 +65,38 @@ def _tau_c_eff(base: float, ceiling: float, chunk_idx: int,
     return ceiling - (ceiling - base) * decay
 
 
+def _unload_before_sampling() -> float | None:
+    mm = comfy.model_management
+    try:
+        dev = mm.get_torch_device()
+        before = int(mm.get_free_memory(dev))
+    except Exception:
+        dev = None
+        before = None
+    mm.unload_all_models()
+    mm.soft_empty_cache()
+    if dev is None or before is None:
+        return None
+    try:
+        return max(0.0, int(mm.get_free_memory(dev)) - before) / 1024.0 ** 3
+    except Exception:
+        return None
+
+
+def _enable_expandable_segments() -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        conf = str(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+        if "expandable_segments" in conf:
+            return "env"
+        torch.cuda.memory._set_allocator_settings(
+            "expandable_segments:True")
+        return "runtime"
+    except Exception:
+        return "off"
+
+
 def _split_run(n_tokens: int, max_new: int, plus2: bool) -> list[int]:
     plus = 2 if plus2 else 0
     groups = (n_tokens - plus) // 5
@@ -84,19 +116,28 @@ def _tail_margin_tokens(tail_margin_px: int) -> tuple[int, int]:
 
 
 def _plan_chunk_tokens(new_lf0: int, num_chunks: int, overlap: int,
-                       tail_margin_px: int = 12
+                       tail_margin_px: int = 12, ctx_mode: str = "none"
                        ) -> tuple[list[int], int, int, bool]:
     new_cont = new_lf0 - 2
     px0 = _px_of_tokens(new_lf0, 0)
     pxc = _px_of_tokens(new_cont, 2)
+    ctx = ctx_mode == "cont"
     _tm_lf, _tm_px = _tail_margin_tokens(tail_margin_px)
     cap_px = int(_WINDOW_CAP_S * _NATIVE_FPS)
     eff = _snap_overlap(overlap)
-    win_px = (px0 if num_chunks == 1
-              else _px_of_tokens(eff, 0) + max(px0, pxc)) + _tm_px
-    while num_chunks > 1 and win_px > cap_px and eff > _MIN_OVERLAP_TOKENS:
+
+    def _win(e: int) -> int:
+        if ctx:
+            return _px_of_tokens(e, 0) + pxc + _tm_px
+        if num_chunks == 1:
+            return px0 + _tm_px
+        return _px_of_tokens(e, 0) + max(px0, pxc) + _tm_px
+
+    win_px = _win(eff)
+    while ((num_chunks > 1 or ctx) and win_px > cap_px
+           and eff > _MIN_OVERLAP_TOKENS):
         eff -= 5
-        win_px = _px_of_tokens(eff, 0) + max(px0, pxc) + _tm_px
+        win_px = _win(eff)
     px_ol = _px_of_tokens(eff, 0)
     if win_px <= cap_px or px_ol + max(px0, pxc) <= cap_px:
         return ([new_lf0] + [new_cont] * (num_chunks - 1), eff, win_px, False)
@@ -1599,6 +1640,9 @@ class CLSSH3StreamingSampler:
                     "default": 12, "min": 0, "max": 48, "step": 4,
                     "tooltip": "Extra pixel frames generated at the end of every chunk but NOT delivered: each take's end-of-window wind-down lands there instead of in the seam. 0 = grid-exact windows. The soft 12 s window cap counts the margin.",
                     }),
+                "continuation_context": ("CLSS_CONTEXT", {
+                    "tooltip": "Continuation context from CLSSH3ContinueFromVideo or CLSSH3ReeditChunk. Wired: the run opens on a continuation window - the first chunk carries the context rows (keyframe replay + SLB seed re-noised at tau_v) and the context audio as its tail ref, and delivers the new span preceded by a 2-token head (the saved tail's last 5 px re-covered, the 17k+5 piece head the decoder expects - without it every 5th token would render at the wrong grid phase). A continue context (CLSSH3ContinueFromVideo) asks decode-save to drop that head from the saved frames and audio, so the take starts at the new span; a re-edit context (CLSSH3ReeditChunk) keeps it - the head is part of the span the re-edit replaces. Unwired: the sampler behaves exactly as before.",
+                    }),
             },
         }
     RETURN_TYPES = ("LATENT",)
@@ -1629,7 +1673,23 @@ class CLSSH3StreamingSampler:
         scene_handoff: str = "transition_chunk",
         audio_refine_guider=None,
         tail_margin_px: int = 12,
+        continuation_context=None,
     ):
+        _freed_gb = _unload_before_sampling()
+        print("[CLSS] unloaded all models before sampling"
+              + (f" ({_freed_gb:.2f} GB freed)" if _freed_gb is not None
+                 else ""))
+        _alloc_state = _enable_expandable_segments()
+        if _alloc_state == "env":
+            print("[CLSS] CUDA allocator: expandable_segments enabled "
+                  "(from PYTORCH_CUDA_ALLOC_CONF)")
+        elif _alloc_state == "runtime":
+            print("[CLSS] CUDA allocator: expandable_segments enabled at "
+                  "runtime")
+        elif _alloc_state == "off":
+            print("[CLSS] CUDA allocator: expandable_segments off — set "
+                  "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before "
+                  "starting ComfyUI")
         if fps != _NATIVE_FPS:
             print(f"[CLSS] WARNING: fps={fps} ignored — H3 is {_NATIVE_FPS} fps.")
         fps = float(_NATIVE_FPS)
@@ -1690,6 +1750,37 @@ class CLSSH3StreamingSampler:
                              f"the frame count to 17k+5 px")
         overlap = _snap_overlap(clss_config.overlap_latent_frames)
 
+        _ctx = continuation_context if isinstance(continuation_context, dict) else None
+        _ctx_video = _ctx.get("video") if _ctx is not None else None
+        _ctx_aud = _ctx.get("aud_ref") if _ctx is not None else None
+        _ctx_pins = list(_ctx.get("pins") or []) if _ctx is not None else []
+        _ctx_vref = _ctx.get("vref") if _ctx is not None else None
+        _ctx_mode = "cont" if _ctx_video is not None else "none"
+        _ctx_trim = bool(_ctx.get("trim_head")) if _ctx is not None else False
+        if _ctx_video is not None:
+            if (int(_ctx_video.ndim) != 5 or int(_ctx_video.shape[3]) != H
+                    or int(_ctx_video.shape[4]) != W):
+                raise ValueError(
+                    f"continuation context rows {tuple(_ctx_video.shape)} do "
+                    f"not match the run's latent grid [*, *, *, {H}, {W}] — "
+                    f"the context must come from the same template "
+                    f"resolution")
+            if int(_ctx_video.shape[2]) != overlap:
+                raise ValueError(
+                    f"continuation context carries {int(_ctx_video.shape[2])} "
+                    f"row(s) but the config's overlap is {overlap} token(s) — "
+                    f"rebuild the context node with the same clss_config")
+        for _pin in _ctx_pins:
+            _pl = _pin.get("latent")
+            if (not torch.is_tensor(_pl) or int(_pl.ndim) != 5
+                    or int(_pl.shape[2]) != 1
+                    or int(_pl.shape[3]) != H or int(_pl.shape[4]) != W):
+                raise ValueError(
+                    "a pinned frame latent does not match the run's latent "
+                    "grid — rebuild the context node from the same template")
+        if _ctx_aud is not None or _ctx_vref is not None:
+            _mc_apply_patch()
+
         _ups = upscaler
         if _ups is not None and not hasattr(_ups, "upscale"):
             raise ValueError(
@@ -1714,14 +1805,24 @@ class CLSSH3StreamingSampler:
 
         img_guide_latent: torch.Tensor | None = None
         if image is not None and vae is not None:
+            if _ctx is not None:
+                print("[CLSS] WARNING: the i2v guide image is ignored — a "
+                      "continuation context is wired (its pins carry the "
+                      "anchor frames).")
             img = image[:1, ..., :3].movedim(-1, 1)
             img = comfy.utils.common_upscale(img, W * 16, H * 16, "lanczos", "disabled")
             img_guide_latent = vae.encode(img.movedim(1, -1))
 
         cap_px = int(_WINDOW_CAP_S * fps)
         plan_tokens, _eff_overlap, _win_px, _auto_split = _plan_chunk_tokens(
-            new_lf0, num_chunks, overlap, tail_margin_px)
+            new_lf0, num_chunks, overlap, tail_margin_px, ctx_mode=_ctx_mode)
         px_ol = _px_of_tokens(_eff_overlap, 0)
+        if _ctx_mode != "none" and _eff_overlap != overlap:
+            raise ValueError(
+                f"the {_WINDOW_CAP_S:.0f} s window cap clamped the overlap "
+                f"{overlap} -> {_eff_overlap} token(s); the continuation "
+                f"context was built for {overlap} — shorten the chunk "
+                f"template or the tail_margin_px")
         if _auto_split:
             print(f"[CLSS] chunk window exceeds the {_WINDOW_CAP_S:.0f} s cap — "
                   f"auto-split into {len(plan_tokens)} sub-chunks "
@@ -1749,6 +1850,12 @@ class CLSSH3StreamingSampler:
         _scene_of = [min(int(_i * num_scenes / _eff_num_chunks), num_scenes - 1)
                      if num_scenes > 1 else 0
                      for _i in range(_eff_num_chunks)]
+        if _ctx is not None and int(_ctx.get("scene", 0)) >= 1:
+            _cs = min(int(_ctx["scene"]) - 1, max(0, num_scenes - 1))
+            if _cs != _scene_of[0]:
+                print(f"[CLSS] continuation context: first window uses scene "
+                      f"{_cs + 1} of {num_scenes} (scene override).")
+            _scene_of = [_cs] + list(_scene_of[1:])
         _cumpx = [0]
         for _cf in chunk_plan:
             _cumpx.append(_cumpx[-1] + int(_cf[2]))
@@ -1867,9 +1974,26 @@ class CLSSH3StreamingSampler:
                       f"(e.g. 6 for 3 scenes).")
 
         _max_win_px = max(
-            [_px_of_tokens(chunk_plan[0][0], 0)]
+            [_px_of_tokens(chunk_plan[0][0], 0)
+             + (px_ol if _ctx_mode != "none" else 0)]
             + [px_ol + _px_of_tokens(_p, _eff_overlap % 5) for _p, _a, _pxn in chunk_plan[1:]]
         )
+        if _ctx is not None:
+            _cv_n = 0 if _ctx_video is None else int(_ctx_video.shape[2])
+            print(f"[CLSS] continuation context: {_cv_n} row(s) "
+                  f"({_px_of_tokens(_cv_n, 0)} px)"
+                  + (f" + audio ref {int(_ctx_aud['ref_audio_t'])}af"
+                     if _ctx_aud is not None else " + no audio ref")
+                  + f" | pins {len(_ctx_pins)}"
+                  + (f" | video ref {int(_ctx_vref['latent_t'])}tok"
+                     if _ctx_vref is not None else "")
+                  + " | first window "
+                  + (f"re-render ({chunk_plan[0][2]} px = 2-token head "
+                     f"({_px_of_tokens(2, (_eff_overlap - 2) % 5)} px) + "
+                     f"{_px_of_tokens(chunk_plan[0][0] - 2, 2)} px new; head "
+                     f"{'dropped' if _ctx_trim else 'kept'} at decode-save)"
+                     if _ctx_mode == "cont"
+                     else "generation + pins"))
         print(f"[CLSS] plan: {_eff_num_chunks} chunk(s) of {plan_tokens[0]}"
               f"{'+' + str(plan_tokens[1]) if _eff_num_chunks > 1 else ''} tokens, "
               f"overlap={_eff_overlap} tokens ({px_ol} px / {Ta_ol} af), "
@@ -1898,6 +2022,7 @@ class CLSSH3StreamingSampler:
                          "bad": [], "join_af_exact": [],
                          "total_af_exact": 0.0}
         _audio_tail: torch.Tensor | None = None
+        _ctx_trim_rec: dict | None = None
         _slb_std_base: float | None = None
         _s1_prev_last: torch.Tensor | None = None
         _s1_aud_rms_ref: float | None = None
@@ -1928,14 +2053,18 @@ class CLSSH3StreamingSampler:
         _vid_pos = 0
         _aud_pos = 0
         for chunk_idx in range(_eff_num_chunks):
-            is_first = chunk_idx == 0
+            is_first = chunk_idx == 0 and _ctx_mode == "none"
+            _ext_v = _ctx_video if chunk_idx == 0 else None
+            _ext_a = _ctx_aud if chunk_idx == 0 else None
+            _ext_vref = _ctx_vref if chunk_idx == 0 else None
             _cur_new_lf, cur_new_af, _cur_new_px = chunk_plan[chunk_idx]
+            _head_lf = 2 if (chunk_idx == 0 and _ctx_mode != "none") else 0
             _cfg_v, _cfg_a, _cfg_g = "kf=-", "aud=-", "guide=off"
             _cfg_lock = ""
             _l_band = _l_std = _l_arms = _l_tg = _l_sp = None
             _cfg_r = ""
             chunk_overlap = 0 if is_first else _eff_overlap
-            total_lf = chunk_overlap + _cur_new_lf + _tm_lf
+            total_lf = chunk_overlap + (_cur_new_lf - _head_lf) + _tm_lf
             _plan_entry = _cond_plan[chunk_idx]
             _is_transition = isinstance(_plan_entry, tuple)
             scene_idx = (_plan_entry[1] if _plan_entry[2] >= 0.5 else _plan_entry[0]) \
@@ -1963,10 +2092,13 @@ class CLSSH3StreamingSampler:
             keyframes: list[dict] = []
             if is_first and img_guide_latent is not None:
                 keyframes.append({"resolved_frame_index": 0, "latent": img_guide_latent})
-            has_slb = not is_first and clss_state.overlap_latent is not None
+            has_slb = (not is_first
+                       and (_ext_v is not None
+                            or clss_state.overlap_latent is not None))
             _slb_ctx = None
             if has_slb:
-                _slb_ctx = clss_state.overlap_latent
+                _slb_ctx = (_ext_v if _ext_v is not None
+                            else clss_state.overlap_latent)
                 _cur_std = float(_slb_ctx.float().std(unbiased=False))
                 if _slb_std_base is None:
                     _slb_std_base = _cur_std
@@ -1981,9 +2113,17 @@ class CLSSH3StreamingSampler:
                 keyframes.extend(_build_video_context_keyframes(
                     _slb_ctx if _slb_ctx is not None
                     else clss_state.overlap_latent, chunk_overlap))
+            if chunk_idx == 0 and _ctx_pins:
+                for _pin in _ctx_pins:
+                    keyframes.append({"resolved_frame_index": int(_pin["index"]),
+                                      "latent": _pin["latent"]})
             _aud_ref_blk = None
             _aud_src = ""
-            if (not is_first and _audio_tail is not None
+            if not is_first and _ext_a is not None and _scene_aud_n == 0:
+                _aud_ref_blk = _ext_a
+                _aud_src = "ext"
+                _cfg_g = (f"audref={int(_aud_ref_blk['ref_audio_t'])}af(ext)")
+            elif (not is_first and _audio_tail is not None
                     and _scene_aud_n == 0):
                 _span_px = float(px_ol)
                 _aud_ref_blk, _aud_src = _build_audio_ref_block(
@@ -2003,13 +2143,14 @@ class CLSSH3StreamingSampler:
                               if _is_transition else pos_conds[scene_idx])
                 if keyframes:
                     _pos_entry = {**_pos_entry, "minimax_keyframes": keyframes}
+                if _ext_vref is not None or _aud_ref_blk is not None:
+                    _new_refs = list(_pos_entry.get("minimax_refs") or [])
+                    if _ext_vref is not None:
+                        _new_refs = _new_refs + [_ext_vref]
+                    if _aud_ref_blk is not None:
+                        _new_refs = _new_refs + [_aud_ref_blk]
+                    _pos_entry = {**_pos_entry, "minimax_refs": _new_refs}
                 if _aud_ref_blk is not None:
-                    _pos_entry = {
-                        **_pos_entry,
-                        "minimax_refs": (
-                            list(_pos_entry.get("minimax_refs") or [])
-                            + [_aud_ref_blk]),
-                    }
                     _pos_entry = _apply_scene_cont(_pos_entry)
                 guider_chunk.original_conds = {
                     **guider.original_conds,
@@ -2030,14 +2171,24 @@ class CLSSH3StreamingSampler:
             _cfg_v = (f"kf={len(keyframes)}" if keyframes else "kf=-")
             if has_slb:
                 _cfg_v += f" tau_v={_tau_v:.3f}{_cfg_lock}"
-            chunk_af = _af_of_px((0 if is_first else px_ol) + _cur_new_px
+            _win_new_px = _px_of_tokens(_cur_new_lf - _head_lf,
+                                        chunk_overlap % 5)
+            _head_px = _px_of_tokens(_head_lf,
+                                     (_eff_overlap - _head_lf) % 5)
+            chunk_af = _af_of_px((0 if is_first else px_ol) + _win_new_px
                                  + _tm_px)
             _Ta_ol_w = chunk_af - cur_new_af - _tm_af
-            _b_af = 0.0 if is_first else float(FRAME_RESCALE) * float(px_ol)
+            _b_af = (0.0 if is_first
+                     else float(FRAME_RESCALE) * float(px_ol - _head_px))
             _d_af = int(_b_af)
             _head_af = float(_b_af - _d_af)
             _fill_af = (_b_af + float(_cur_new_px) * float(FRAME_RESCALE)
                         - float(chunk_af - _tm_af))
+            if _head_lf and _ctx_trim:
+                _ctx_trim_rec = {
+                    "px": int(_head_px),
+                    "af": float(_head_af)
+                    + float(_head_px) * float(FRAME_RESCALE)}
             lat_aud = torch.zeros(B_a, C_a, lanes_a, chunk_af, device=device)
             mask_aud = torch.ones(1, 1, lanes_a, chunk_af, device=device)
             if not is_first:
@@ -2061,9 +2212,10 @@ class CLSSH3StreamingSampler:
                 print(f"[CLSS] chunk {chunk_idx + 1}/{_eff_num_chunks} "
                       f"scene {scene_idx}"
                       f"{' (transition)' if _is_transition else ''}: "
-                      f"win {px_ol + _cur_new_px + _tm_px}px/{chunk_af}af "
+                      f"win {px_ol + _win_new_px + _tm_px}px/{chunk_af}af "
                       f"tm={_tm_px}px "
-                      f"join_af={_Ta_ol_w} cut={_d_af}af "
+                      + (f"head={_head_px}px " if _head_lf else "")
+                      + f"join_af={_Ta_ol_w} cut={_d_af}af "
                       f"splice={_head_af:.2f}/{_fill_af:.2f}af "
                       f"{_cfg_v} {_cfg_a} {_cfg_g} {_cfg_s}{_cfg_r}{_rc_tag}")
             _chunk_noise = _SlicedNoise(
@@ -2291,8 +2443,8 @@ class CLSSH3StreamingSampler:
                       f"step) | audio vs turbo take cos={_rcm_cos:.3f} rms "
                       f"x{_rcm_rms:.2f}")
 
-            new_vid = vid_out[:, :, chunk_overlap:
-                              chunk_overlap + _cur_new_lf]
+            new_vid = vid_out[:, :, chunk_overlap - _head_lf:
+                              chunk_overlap - _head_lf + _cur_new_lf]
             corrected = clss_state.post_process(new_vid)
 
             _da_x = corrected.float()
@@ -2349,7 +2501,8 @@ class CLSSH3StreamingSampler:
             acc_video.append(corrected.cpu())
             if _up_active:
                 _t_up0 = time.time()
-                _up_in = torch.cat([vid_out[:, :, :chunk_overlap], corrected],
+                _ov_hr = chunk_overlap - _head_lf
+                _up_in = torch.cat([vid_out[:, :, :_ov_hr], corrected],
                                    dim=2)
                 _up_hr = _ups.upscale(_up_in, _up_scale, device=_up_dev)
                 _dt_up = time.time() - _t_up0
@@ -2357,8 +2510,8 @@ class CLSSH3StreamingSampler:
                 print(f"[CLSS]   upscale {int(_up_in.shape[2])} tok -> "
                       f"{_up_hr.shape[-1] * 16}x{_up_hr.shape[-2] * 16} px in "
                       f"{_dt_up:.1f}s")
-                _blend_upscaled_overlap(acc_video_hr, _up_hr, chunk_overlap)
-                acc_video_hr.append(_up_hr[:, :, chunk_overlap:].cpu())
+                _blend_upscaled_overlap(acc_video_hr, _up_hr, _ov_hr)
+                acc_video_hr.append(_up_hr[:, :, _ov_hr:].cpu())
             _trend["vid_intra"].append(_frame_cos(corrected[:, :, 0], corrected[:, :, -1]))
             if _s1_prev_last is not None:
                 _trend["vid_bnd"].append(_frame_cos(_s1_prev_last.to(device), corrected[:, :, 0]))
@@ -2615,15 +2768,38 @@ class CLSSH3StreamingSampler:
             sum(int(_cf[2]) for _cf in chunk_plan) * float(FRAME_RESCALE))
         return ({"samples": output_samples,
                  "clss_audio_chunk_ends": list(audio_chunk_ends),
-                 "clss_audio_splice": _splice},)
+                 "clss_audio_splice": _splice,
+                 "clss_ctx_trim": _ctx_trim_rec},)
 
 
 def _splice_delivered_audio(audio: torch.Tensor, splice: dict,
-                            spf: float) -> torch.Tensor:
+                            spf: float, trim_af: float = 0.0
+                            ) -> torch.Tensor:
+    def _trim_front(a: torch.Tensor) -> torch.Tensor:
+        if trim_af <= 0.0:
+            return a
+        d = int(round(float(trim_af) * spf))
+        if d <= 0 or d >= int(a.shape[-1]):
+            return a
+        a = a[..., d:].contiguous()
+        want_t = int(round(max(
+            0.0, float(splice.get("total_af_exact") or 0.0)
+            - float(trim_af)) * spf))
+        if want_t > 0:
+            if a.shape[-1] < want_t:
+                miss = want_t - int(a.shape[-1])
+                if miss <= max(4, int(round(spf))):
+                    a = F.pad(a, (0, miss))
+            elif a.shape[-1] > want_t:
+                a = a[..., :want_t]
+        print(f"[CLSS] decode_save: context head trim: {d} smp "
+              f"({trim_af:.2f} af) dropped - the take starts at the new span")
+        return a
+
     lens = [max(0, int(round(float(a) * spf)))
             for a in splice.get("delivered_af") or []]
     if len(lens) < 2:
-        return audio
+        return _trim_front(audio)
     heads = [max(0, int(round(float(a) * spf)))
              for a in splice.get("head_af") or []]
     fills = [int(round(float(a) * spf)) for a in splice.get("fill_af") or []]
@@ -2664,7 +2840,7 @@ def _splice_delivered_audio(audio: torch.Tensor, splice: dict,
         else:
             parts.append(seg)
     if repaired == 0:
-        return audio
+        return _trim_front(audio)
     audio = torch.cat(parts, dim=-1)
     want = int(round(float(splice.get("total_af_exact") or 0.0) * spf))
     if want > 0:
@@ -2680,7 +2856,7 @@ def _splice_delivered_audio(audio: torch.Tensor, splice: dict,
     print(f"[CLSS] decode_save: seam splice: {repaired}/{len(lens) - 1} "
           f"junction(s) spliced, {blended} smp "
           f"({blended / (spf * 40.0) * 1000.0:.1f} ms) crossfaded")
-    return audio
+    return _trim_front(audio)
 
 
 class CLSSH3VideoDecodeSave:
@@ -2722,6 +2898,11 @@ class CLSSH3VideoDecodeSave:
             raise ValueError("CLSSH3VideoDecodeSave expects a MiniMax H3 AV latent")
         vid, aud = samples.unbind()
         T = vid.shape[2]
+        _trim = (latent.get("clss_ctx_trim")
+                 if isinstance(latent, dict) else None)
+        _trim_px = int(_trim.get("px", 0)) if isinstance(_trim, dict) else 0
+        _trim_af = (float(_trim.get("af", 0.0))
+                    if isinstance(_trim, dict) else 0.0)
 
         fsm = getattr(vae, "first_stage_model", None)
 
@@ -2745,6 +2926,11 @@ class CLSSH3VideoDecodeSave:
             c = 0 if pos == 0 else min(ctx, pos)
             px = vae.decode(vid[:, :, pos - c:end])
             drop = _px_for_tokens(c) if c else 0
+            if pos == 0 and _trim_px > 0:
+                drop = min(drop + _trim_px, int(px.shape[1]))
+                print(f"[CLSS] decode_save: context head trim: first "
+                      f"{_trim_px} frame(s) dropped - the take starts at "
+                      f"the new span")
             arr = (px[0, drop:].float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
             for f in range(arr.shape[0]):
                 Image.fromarray(arr[f]).save(
@@ -2765,8 +2951,11 @@ class CLSSH3VideoDecodeSave:
                    if isinstance(latent, dict) else None)
         _ends = (latent.get("clss_audio_chunk_ends")
                  if isinstance(latent, dict) else None)
-        if _splice and len(_splice.get("delivered_af") or []) >= 2:
-            audio = _splice_delivered_audio(audio, _splice, _spf)
+        if _trim_af > 0.0 and _ends:
+            _ends = [float(_e) - _trim_af for _e in _ends]
+        if _splice or _trim_af > 0.0:
+            audio = _splice_delivered_audio(audio, _splice or {}, _spf,
+                                            _trim_af)
         if _ends and len(_ends) >= 2:
             _b0 = [0] + [int(round(af / 40.0 * vae_sr)) for af in _ends[:-1]]
             _b0.append(int(audio.shape[-1]))
@@ -2793,6 +2982,333 @@ class CLSSH3VideoDecodeSave:
         return ({"waveform": audio, "sample_rate": vae_sr},)
 
 
+_FRAME_FILE_EXTS = (".png",)
+_AUDIO_FILE_EXTS = (".flac", ".wav", ".mp3", ".ogg", ".opus", ".m4a")
+_AUDIO_MIN_SAMPLES = 800
+
+
+def _output_folder(prefix: str) -> tuple[str, str]:
+    import folder_paths
+    norm = os.path.normpath(prefix)
+    return (os.path.join(folder_paths.get_output_directory(),
+                         os.path.dirname(norm)),
+            os.path.basename(norm))
+
+
+def _indexed_files(folder: str, name: str,
+                   exts: tuple) -> list[tuple[int, str]]:
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return []
+    out: list[tuple[int, str]] = []
+    for fn in entries:
+        stem, ext = os.path.splitext(fn)
+        if ext.lower() not in exts or not stem.startswith(name):
+            continue
+        tail = stem[len(name):]
+        if not tail.startswith("_"):
+            continue
+        tail = tail[1:]
+        if tail.isdigit():
+            out.append((int(tail), os.path.join(folder, fn)))
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def _load_frame_range(images_prefix: str, start: int, count: int,
+                      h_lat: int, w_lat: int, tail_extra: int = 0
+                      ) -> tuple[torch.Tensor, int]:
+    from PIL import Image
+    import numpy as np
+    folder, name = _output_folder(images_prefix)
+    found = dict(_indexed_files(folder, name, _FRAME_FILE_EXTS))
+    if not found:
+        raise ValueError(f"no frames found for prefix {images_prefix!r} in "
+                         f"{folder} — point filename_prefix at the saved "
+                         f"run's decode prefix")
+    if start < 0:
+        start = max(0, max(found) + 1 + start)
+    frames = []
+    idx = start
+    while idx < start + count and idx in found:
+        with Image.open(found[idx]) as im:
+            frames.append(torch.from_numpy(
+                np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0))
+        idx += 1
+    if len(frames) < count:
+        if len(frames) < count - tail_extra:
+            raise ValueError(
+                f"{images_prefix!r} holds frames up to {max(found)} — need "
+                f"{start}..{start + count - 1} ({count} frame(s)); a re-edit "
+                f"needs the chunk's span plus the overlap frames before it")
+        print(f"[CLSS] context frames: only {len(frames)}/{count} frame(s) "
+              f"available from {start} — the tail is padded with the last "
+              f"frame")
+        frames = frames + [frames[-1]] * (count - len(frames))
+    out = torch.stack(frames, dim=0)
+    if out.shape[1] != h_lat * 16 or out.shape[2] != w_lat * 16:
+        print(f"[CLSS] context frames: {out.shape[2]}x{out.shape[1]} resized "
+              f"to the template canvas {w_lat * 16}x{h_lat * 16}")
+        out = comfy.utils.common_upscale(
+            out.movedim(-1, 1), w_lat * 16, h_lat * 16, "lanczos",
+            "disabled").movedim(1, -1)
+    return out, int(start)
+
+
+def _load_audio_prefix(audio_prefix: str):
+    folder, name = _output_folder(audio_prefix)
+    for ext in _AUDIO_FILE_EXTS:
+        found = _indexed_files(folder, name, (ext,))
+        if found:
+            path = found[-1][1]
+            from comfy_extras.nodes_audio import load as _load_audio
+            waveform, rate = _load_audio(path)
+            print(f"[CLSS] context audio: {os.path.basename(path)} "
+                  f"({waveform.shape[-1] / rate:.1f}s @ {rate} Hz)")
+            return {"waveform": waveform.unsqueeze(0), "sample_rate": rate}
+    print(f"[CLSS] WARNING: no audio file for prefix {audio_prefix!r} in "
+          f"{folder} — no audio context is attached")
+    return None
+
+
+def _template_geometry(latent) -> tuple[int, int, int]:
+    samples = latent.get("samples") if isinstance(latent, dict) else None
+    if not (getattr(samples, "is_nested", False)
+            and len(samples.unbind()) == 2):
+        raise ValueError("this node needs the MiniMax H3 AV latent template "
+                         "from EmptyMiniMaxH3LatentAV")
+    vid = samples.unbind()[0]
+    if (vid.ndim != 5 or int(vid.shape[1]) != 24 or int(vid.shape[2]) < 7
+            or int(vid.shape[2]) % 5 != 2):
+        raise ValueError(f"template video latent {tuple(vid.shape)} is not on "
+                         f"the H3 5k+2 grid")
+    return int(vid.shape[2]), int(vid.shape[3]), int(vid.shape[4])
+
+
+def _encode_context_video(vae, frames: torch.Tensor, h_lat: int, w_lat: int,
+                          want_tokens: int, label: str) -> torch.Tensor:
+    z = vae.encode(frames)
+    if (z.ndim != 5 or int(z.shape[2]) != int(want_tokens)
+            or int(z.shape[3]) != int(h_lat) or int(z.shape[4]) != int(w_lat)):
+        raise ValueError(
+            f"{label}: {frames.shape[0]} frame(s) encoded to {tuple(z.shape)} "
+            f"— expected [1, 24, {want_tokens}, {h_lat}, {w_lat}]. The saved "
+            f"frames must come from a run with the same template resolution "
+            f"and the same overlap in its clss_config.")
+    return z.cpu()
+
+
+def _encode_pin_latent(vae, frame: torch.Tensor) -> torch.Tensor:
+    z = vae.encode(frame.unsqueeze(0))
+    if z.ndim != 5 or int(z.shape[2]) != 1:
+        raise ValueError(f"a pinned frame encoded to {tuple(z.shape)} — "
+                         f"expected [1, 24, 1, h, w]")
+    return z.cpu()
+
+
+def _edit_pins(vae, frames: torch.Tensor, need_ctx: int, new_px: int,
+               mode: str, head_px: int = 0) -> list[dict]:
+    out: list[dict] = []
+    if mode in ("first+last", "first"):
+        out.append({"index": need_ctx - head_px,
+                    "latent": _encode_pin_latent(vae,
+                                                 frames[need_ctx - head_px])})
+    if mode in ("first+last", "last"):
+        out.append({"index": need_ctx + new_px - 1,
+                    "latent": _encode_pin_latent(
+                        vae, frames[need_ctx + new_px - 1])})
+    return out
+
+
+def _context_audio_block(audio_vae, audio, start_px: int, span_px: int):
+    if audio_vae is None:
+        raise ValueError("an audio context needs the audio_vae input")
+    waveform, vae_sr = _ref_audio_waveform(audio_vae, audio)
+    spf = float(vae_sr) / float(_NATIVE_FPS)
+    total = int(waveform.shape[-1])
+    a = max(0, min(total, int(round(start_px * spf))))
+    b = max(a, min(total, int(round((start_px + span_px) * spf))))
+    if b - a < _AUDIO_MIN_SAMPLES:
+        print(f"[CLSS] WARNING: audio context span {b - a} sample(s) at "
+              f"{start_px} px is shorter than one VAE step "
+              f"({_AUDIO_MIN_SAMPLES}) — no audio context is attached")
+        return None
+    _item, blk = _encode_ref_audio_slice(audio_vae,
+                                         waveform[..., a:b].contiguous())
+    blk[_MC_AUDIO_KEY] = float(span_px)
+    print(f"[CLSS] context audio ref: samples [{a}, {b}) -> "
+          f"{int(blk['ref_audio_t'])} af "
+          f"({int(blk['ref_audio_t']) / AUDIO_LATENT_FPS:.2f} s) ending at "
+          f"the join")
+    return blk
+
+
+def _video_ref_block(vae, clip_frames: torch.Tensor, pool: int,
+                     stride: int) -> dict:
+    z = vae.encode(clip_frames).float()
+    if z.ndim != 5:
+        raise ValueError(f"the video-ref clip encoded to {tuple(z.shape)}")
+    pool = max(1, int(pool))
+    stride = max(1, int(stride))
+    if pool > 1:
+        m = 2 * pool
+        z = z[..., :(z.shape[-2] // m) * m, :(z.shape[-1] // m) * m]
+        z = F.avg_pool3d(z, (1, pool, pool))
+    if stride > 1:
+        z = z[:, :, ::stride]
+    blk = {"kind": "video", "latent_t": int(z.shape[2]),
+           "latent_h": int(z.shape[3]), "latent_w": int(z.shape[4]),
+           "ref_audio_t": 0, "latent": z.contiguous(),
+           "audio_latent": None}
+    if stride > 1:
+        blk[_MC_VIDEO_KEY] = stride
+    return blk
+
+
+class CLSSH3ContinueFromVideo(io.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CLSSH3ContinueFromVideo",
+            display_name="CLSS H3 Continue From Video",
+            category="MiniMaxH3-CLSS",
+            description="Continue a finished CLSS run where it ended: the last overlap span of its saved PNG frames is re-encoded into the opening context (keyframe replay + SLB seed) and the tail of its saved audio becomes the tail ref, so the new run's first window generates the next span as a continuation of the real previous take. The first delivered window re-covers the saved run's last 5 px (0.21 s) as a 2-token head - the 17k+5 head a fresh piece starts with, which fixes the token grid phase. The head is decoded with the run but excluded from the saved output (decode-save drops those frames and the matching 0.21 s of audio), so the take carries exactly the new span and appends after the saved run with nothing to trim.",
+            inputs=[
+                io.Latent.Input("latent", tooltip="Per-chunk AV template (EmptyMiniMaxH3LatentAV) the new run will use: its resolution must match the saved frames, its length sets the chunk geometry."),
+                io.Vae.Input("vae", tooltip="Video VAE, used to re-encode the saved tail frames into context rows."),
+                io.Custom("CLSS_CONFIG").Input("clss_config", tooltip="CLSSH3Config of the new run: the overlap token count defines the context span, so it must match the config the sampler runs with."),
+                io.String.Input("filename_prefix", default="clss_h3/t2v/CLSSH3_frame_", tooltip="Frame prefix of the finished run - the same string its decode-save node wrote. The last overlap-span frames under that prefix become the context."),
+                io.Int.Input("scene_index", default=1, min=1, max=64, tooltip="Which scene block of the prompt node the saved run ENDS in (1-based): multi-scene prompts use one conditioning entry per '---' block, and the continuation window must carry that scene's text. Single-scene prompts: leave 1."),
+                io.String.Input("audio_prefix", default="audio/t2v/CLSSH3", tooltip="Audio prefix of the finished run - the same string its save-audio node wrote. The newest matching file's tail (overlap span, ending at the join) becomes the run's audio tail ref. Empty = no audio context."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE (MiniMaxH3AudioVAE), required when audio_prefix resolves to a file."),
+            ],
+            outputs=[
+                io.Custom("CLSS_CONTEXT").Output(display_name="context"),
+                io.Int.Output(display_name="context_frames", tooltip="Pixel frames the context carries (the run's overlap span)."),
+            ],
+        )
+
+    @classmethod
+    @torch.inference_mode()
+    def execute(cls, latent, vae, clss_config, filename_prefix,
+                scene_index=1, audio_prefix="audio/t2v/CLSSH3", audio_vae=None):
+        _lf0, h_lat, w_lat = _template_geometry(latent)
+        overlap = _snap_overlap(clss_config.overlap_latent_frames)
+        px_ol = _px_of_tokens(overlap, 0)
+        frames, abs_start = _load_frame_range(filename_prefix, -px_ol, px_ol,
+                                              h_lat, w_lat)
+        ctx_video = _encode_context_video(vae, frames, h_lat, w_lat, overlap,
+                                          "continuation context")
+        aud_blk = None
+        if audio_prefix:
+            audio = _load_audio_prefix(audio_prefix)
+            if audio is not None:
+                aud_blk = _context_audio_block(audio_vae, audio, abs_start,
+                                               px_ol)
+        print(f"[CLSS] continuation context: frames {abs_start}.."
+              f"{abs_start + px_ol - 1} of {filename_prefix} -> "
+              f"{int(ctx_video.shape[2])} row(s) ({px_ol} px)"
+              + (f" + audio ref {int(aud_blk['ref_audio_t'])}af"
+                 if aud_blk is not None else " + no audio ref"))
+        return io.NodeOutput(
+            {"video": ctx_video, "aud_ref": aud_blk, "pins": [],
+             "vref": None, "px_ol": int(px_ol), "scene": int(scene_index),
+             "trim_head": True},
+            int(px_ol))
+
+
+class CLSSH3ReeditChunk(io.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CLSSH3ReeditChunk",
+            display_name="CLSS H3 Re-edit Chunk",
+            category="MiniMaxH3-CLSS",
+            description="Re-render one chunk of a finished CLSS run without regenerating the run. The chunk is rebuilt as a continuation of the saved frames right before it (context rows + audio tail ref) and re-covers the saved run's last 5 px (0.21 s) as a 2-token head - the same 17k+5 head a fresh piece starts with, which keeps the token grid phase identical to the decoded stream. The head is part of the re-rendered span (kept in the output): it replaces the saved frames at start_frame. Optional first/last frame pins copied from the saved video anchor the seam frames, so the re-rendered chunk drops into place. Chunk 1 has no predecessor and is rebuilt from its pins alone.",
+            inputs=[
+                io.Latent.Input("latent", tooltip="Per-chunk AV template (EmptyMiniMaxH3LatentAV) the saved run used: its resolution must match the saved frames, its length sets the chunk geometry the re-rendered span is derived from."),
+                io.Vae.Input("vae", tooltip="Video VAE, used to re-encode the saved frames (context rows, pinned frames, optional video reference)."),
+                io.Custom("CLSS_CONFIG").Input("clss_config", tooltip="CLSSH3Config of the saved run: the overlap token count defines the context span and must match the config the sampler runs with."),
+                io.String.Input("filename_prefix", default="clss_h3/t2v/CLSSH3_frame_", tooltip="Frame prefix of the finished run - the same string its decode-save node wrote. Chunk k starts at the cumulative delivered span of the chunks before it (chunk 1 = 17k+5 px at the template length, every later chunk = 17k px)."),
+                io.Int.Input("chunk_index", default=2, min=1, max=500, tooltip="1-based chunk of the saved run to re-render. Chunks 2+ are rebuilt as continuations of the saved frames before them; chunk 1 has no predecessor and is rebuilt from its pins alone."),
+                io.Int.Input("scene_index", default=1, min=1, max=64, tooltip="Which scene block of the prompt node the saved chunk belongs to (1-based). Multi-scene prompts use one conditioning entry per '---' block - set the prompt text to that scene's text so the re-render carries it. Single-scene prompts: leave 1."),
+                io.Combo.Input("pin_frames", options=["first+last", "last", "first", "off"], default="first+last", tooltip="Frames copied from the saved video and pinned as clean keyframes: first = the re-rendered span's first delivered frame, last = its last delivered frame (kept at the saved pixels so the saved neighbours still fit). off = a free re-render that may drift from the saved take."),
+                io.Combo.Input("video_ref", options=["off", "on"], default="off", tooltip="Present the saved window's own motion (starting at its context rows, so it lands on the target time grid) to the model as a video reference - the same mechanism the audio recompose uses for its video ref. on = stronger identity to the saved take, more ref tokens; off = the re-render is driven by the context rows and pins only."),
+                io.Int.Input("ref_pool", default=2, min=1, max=4, step=1, optional=True, tooltip="Spatial downscale of the video reference (2 = quarter of the reference tokens). Used when video_ref is on."),
+                io.Int.Input("ref_stride", default=2, min=1, max=5, step=1, optional=True, tooltip="Temporal stride of the video reference; the kept frames are re-spaced onto the target time grid, so the reference keeps true time at fewer tokens. Used when video_ref is on."),
+                io.String.Input("audio_prefix", default="audio/t2v/CLSSH3", tooltip="Audio prefix of the finished run - the same string its save-audio node wrote. The overlap span right before the chunk becomes the audio tail ref. Empty = no audio context."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE (MiniMaxH3AudioVAE), required when audio_prefix resolves to a file."),
+            ],
+            outputs=[
+                io.Custom("CLSS_CONTEXT").Output(display_name="context"),
+                io.Int.Output(display_name="start_frame", tooltip="Saved-video frame index where the re-rendered span starts (its first delivered frame; 5 px before the chunk boundary on chunks 2+, where the span carries the 2-token head)."),
+                io.Int.Output(display_name="frames", tooltip="Pixel frames the re-rendered span covers - replace exactly this many saved frames at start_frame (the span length is unchanged by the head: 243 px for the default 243 px template)."),
+            ],
+        )
+
+    @classmethod
+    @torch.inference_mode()
+    def execute(cls, latent, vae, clss_config, filename_prefix, chunk_index=2,
+                scene_index=1, pin_frames="first+last", video_ref="off",
+                ref_pool=2, ref_stride=2, audio_prefix="audio/t2v/CLSSH3",
+                audio_vae=None):
+        _lf0, h_lat, w_lat = _template_geometry(latent)
+        new_cont = _lf0 - 2
+        px0 = _px_of_tokens(_lf0, 0)
+        pxc = _px_of_tokens(new_cont, 2)
+        overlap = _snap_overlap(clss_config.overlap_latent_frames)
+        px_ol = _px_of_tokens(overlap, 0)
+        k = int(chunk_index)
+        if k < 1:
+            raise ValueError("chunk_index is 1-based")
+        start = 0 if k == 1 else px0 + (k - 2) * pxc
+        need_ctx = 0 if k == 1 else px_ol
+        new_px = px0 if k == 1 else pxc
+        count = need_ctx + new_px
+        _extra = 0
+        if video_ref == "on" and px0 > new_px:
+            _extra = px0 - new_px
+            count = need_ctx + px0
+        frames, abs_start = _load_frame_range(filename_prefix,
+                                              start - need_ctx, count,
+                                              h_lat, w_lat,
+                                              tail_extra=_extra)
+        ctx_video = None
+        if need_ctx:
+            ctx_video = _encode_context_video(
+                vae, frames[:need_ctx], h_lat, w_lat, overlap,
+                f"re-edit context of chunk {k}")
+        _head_px = _px_of_tokens(2, (overlap - 2) % 5) if need_ctx else 0
+        pins = _edit_pins(vae, frames, need_ctx, new_px, pin_frames,
+                          head_px=_head_px)
+        aud_blk = None
+        if need_ctx and audio_prefix:
+            audio = _load_audio_prefix(audio_prefix)
+            if audio is not None:
+                aud_blk = _context_audio_block(audio_vae, audio, abs_start,
+                                               px_ol)
+        vref = None
+        if video_ref == "on":
+            vref = _video_ref_block(vae, frames[:px0], ref_pool, ref_stride)
+        print(f"[CLSS] re-edit chunk {k}: saved frames {abs_start}.."
+              f"{abs_start + count - 1} of {filename_prefix} | re-render span "
+              f"{start - _head_px}..{start + new_px - 1} "
+              f"({new_px + _head_px} px = head {_head_px} px + "
+              f"{new_px} px) | context {need_ctx} px | pins {len(pins)}"
+              + (f" | audio ref {int(aud_blk['ref_audio_t'])}af"
+                 if aud_blk is not None else " | no audio ref")
+              + (f" | video ref {int(vref['latent_t'])}tok"
+                 if vref is not None else ""))
+        return io.NodeOutput(
+            {"video": ctx_video, "aud_ref": aud_blk, "pins": pins,
+             "vref": vref, "px_ol": int(px_ol), "scene": int(scene_index),
+             "trim_head": False},
+            int(start - _head_px), int(new_px + _head_px))
+
+
 NODE_CLASS_MAPPINGS = {
     "CLSSH3Config":           CLSSH3Config,
     "CLSSH3AudioConfig":      CLSSH3AudioConfig,
@@ -2800,6 +3316,8 @@ NODE_CLASS_MAPPINGS = {
     "CLSSH3SceneReference":   CLSSH3SceneReference,
     "CLSSH3SceneReferences":  CLSSH3SceneReferences,
     "CLSSH3SceneReferencesAll": CLSSH3SceneReferencesAll,
+    "CLSSH3ContinueFromVideo": CLSSH3ContinueFromVideo,
+    "CLSSH3ReeditChunk":     CLSSH3ReeditChunk,
     "CLSSH3LoadLatentUpscaleModel": CLSSH3LoadLatentUpscaleModel,
     "CLSSH3StreamingSampler": CLSSH3StreamingSampler,
     "CLSSH3Guider":           CLSSH3Guider,
@@ -2812,6 +3330,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",
     "CLSSH3SceneReferences":  "CLSS H3 Scene References (R2V multi)",
     "CLSSH3SceneReferencesAll": "CLSS H3 Scene References (R2V all scenes)",
+    "CLSSH3ContinueFromVideo": "CLSS H3 Continue From Video",
+    "CLSSH3ReeditChunk":      "CLSS H3 Re-edit Chunk",
     "CLSSH3LoadLatentUpscaleModel": "CLSS H3 Load Latent Upscale Model",
     "CLSSH3StreamingSampler": "CLSS H3 Streaming Sampler",
     "CLSSH3Guider":           "CLSS H3 Guider (Split AV CFG)",

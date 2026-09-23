@@ -1,0 +1,430 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Video VAE (H3) - decode/save + context encodes"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Audio VAE (H3)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_hybrid_b20-49_pruned_w4a8_mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Diffusion model (H3 int8 convrot)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_int4_convrot.safetensors",
+      "type": "auto",
+      "projection": "mmh3-4b-ClipProj-v3.1-mlp.safetensors",
+      "device": "cuda:0",
+      "mode": "resident"
+    },
+    "class_type": "ClipProjLoader",
+    "_meta": {
+      "title": "Text encoder (ClipProj Qwen3-VL-4B + projection)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "prompts": "summary\n[reference generation + audio reuse] The target video cuts to <Subject 3> (Rumi) fighting a massive demon brute in <Subject 5> (a neon alleyway). <Audio 1> pre-chorus begins to build.\n\nretention_analysis\n<Subject 3> (appears in [Shot 2], [Shot 3], [Shot 4], [Shot 5], [Shot 6], [Shot 7]): fully_preserved \u2014 Rumi's identity, long purple braided hair, yellow cropped leather jacket, white crop top, denim shorts, and glowing pink sword are retained from <Picture 3>.\n<Subject 5> (appears in [Shot 2], [Shot 3], [Shot 4], [Shot 5]): fully_preserved \u2014 the narrow neon alleyway, fire escapes, and wet asphalt are retained.\n<Subject 6> (appears in [Shot 3], [Shot 4], [Shot 5]): fully_preserved \u2014 the massive demon brute is retained.\n<Audio 1>: fully_copy \u2014 the complete song is used as the target video's non-diegetic score.\n\ndetailed_description\n[Shot 1] (00:00.000\u201300:01.900) Continue from the previous chunk's final image: <Subject 2> (Mira) raises her spear high on the back of a demon, the neon lights of the bridge flaring behind her. The image holds for a split second, then shatters into geometric shards of pink and blue neon light, wiping the screen.\n\n[Shot 2] At 00:01.900, a hard cut to a rapid downward tracking shot. The camera falls from the top of a narrow alleyway. <Subject 3> (Rumi) is sliding down the metal railing of a fire escape. Her long purple braid whips violently behind her. She wears her yellow cropped leather jacket, white crop top, and denim shorts. She holds her glowing pink sword out to her side, the blade carving sparks against the brick wall as she descends. The camera accelerates with her, capturing the vertical drop.\n\n[Shot 3] At 00:03.200, a sudden hard cut to ground level. Rumi lands on a metal dumpster with a loud clang, denting the lid. Instantly, a massive <Subject 6> (demon brute) crashes through the alley wall, sending bricks flying. Rumi doesn't hesitate; she launches herself off the dumpster, twisting in mid-air. The camera circles around her as she swings her glowing pink sword in a wide, downward arc, clashing directly against the brute's massive shadowy claw. The impact creates a burst of 2D animated pink sparks.\n\n[Shot 4] At 00:04.800, a tight, shaky handheld shot from a low angle. The demon brute swipes its other arm, catching Rumi in the side and throwing her backward. She crashes into a brick wall, cracking the plaster. The camera shakes violently on the impact. Rumi drops to one knee, her purple hair falling over her face. The neon signs in the alley flicker.\n\n[Shot 5] At 00:06.000, a rapid, choppy 2D-animated montage. Three flashing frames: (1) Rumi's hand gripping the hilt of her sword tightly; (2) Her eyes snapping open, glowing pink with fierce determination; (3) Her boots digging into the ground as she launches forward.\n\n[Shot 6] At 00:06.800, a high-speed tracking shot. Rumi sprints directly at the brute. Instead of striking high, she slides across the wet asphalt on her knees, passing directly under the brute's legs. As she slides, she swings her sword upward, slashing the back of the brute's knees. The brute roars in pain and staggers. Rumi springs up behind it, plants her feet on its back, and drives her glowing pink sword vertically downward into its spine with both hands. The frame rate drops to a heavy, stylized 2D \"choppy\" look for the impact, emphasizing the brutal force.\n\n[Shot 7] At 00:08.500, the brute dissolves into black smoke. Rumi lands gracefully on the asphalt, surrounded by the swirling smoke. She twirls her sword once in her hand, flicking the blade to clear the smoke away. She looks directly into the camera lens, smirks, and rests the glowing pink blade on her shoulder. The neon lights of the alley pulse in sync with the building beat of <Audio 1> pre-chorus.\n\noverall_soundscape\nThe alleyway echoes with the clang of the metal dumpster, the shattering of bricks, the roar of the demon brute, the clash of sword against claw, the crack of the brick wall on impact, and the hum of Rumi's glowing pink sword. The sequence is synced to the driving beat of <Audio 1>.\n\nnon_diegetic_music\n<Audio 1> pre-chorus continues to build.",
+      "global_text": "style_guidelines\nThe target video is in the KPop Demon Hunters visual style: a vibrant hybrid 2D/3D animation. It features a glossy, iridescent tertiary color palette (pinks with hints of blue, greens with hints of yellow). The action uses a \"choppy\" lower frame rate to mimic 2D animation during high-impact moments. The camera moves with rhythmic, music-video energy. The world is a neon-soaked, Seoul-inspired cityscape blending traditional Korean elements with modern K-pop concert aesthetics.\n\nsubject_definitions\n<Picture 1> is Zoe, a demon hunter with short dark hair with a bun, a teal crop top, yellow-and-black baggy pants, yellow sneakers, and glowing purple crystal daggers.\n<Picture 2> is Mira, a demon hunter with long pink hair, a black graphic crop top, a yellow mini skirt, black thigh-high boots, and a glowing pink and blue spear.\n<Picture 3> is Rumi, a demon hunter with long purple braided hair, a yellow cropped leather jacket, a white crop top, denim shorts, black boots, and a glowing pink sword.\n<Subject 1> is Zoe from <Picture 1>.\n<Subject 2> is Mira from <Picture 2>.\n<Subject 3> is Rumi from <Picture 3>.\n<Subject 4> is the Hantrix group, consisting of <Subject 1>, <Subject 2>, and <Subject 3>.\n<Subject 5> is the neon-soaked Seoul-inspired city, featuring glossy streets, holographic billboards, and a glowing sky.\n<Subject 6> are the demons, volatile shadowy creatures with glowing red eyes.\n<Audio 1> is the Hantrix song, used as the complete non-diegetic score for the target video.",
+      "audio_continuity_text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "Scene prompts (positive; '---' separates scenes). The continuation starts at the saved run's end, so the text continues THAT piece's action/music."
+    }
+  },
+  "6": {
+    "inputs": {
+      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX",
+      "global_text": "",
+      "audio_continuity_text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "Scene prompts (negative)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "width": [
+        "40",
+        0
+      ],
+      "height": [
+        "40",
+        1
+      ],
+      "length": 243
+    },
+    "class_type": "EmptyMiniMaxH3LatentAV",
+    "_meta": {
+      "title": "Per-chunk template: 832x480, 243 px ~ 10.1 s - must match the saved run"
+    }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Sampler"
+    }
+  },
+  "9": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "42",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Schedule (20 steps, sigma shift 12/6)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise_seed": 605729501891549
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Noise seed (change it for a different take of the continuation)"
+    }
+  },
+  "12": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "rescale": 0.7,
+      "model": [
+        "42",
+        0
+      ],
+      "positive": [
+        "34",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "Guider (video CFG off, audio CFG 4, rescale 0.7)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "filename_prefix": "clss_h3/cont/CLSSH3_frame_",
+      "frames_per_slice": 27,
+      "context_frames": 0,
+      "fps": 24,
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "CLSSH3VideoDecodeSave",
+    "_meta": {
+      "title": "Decode + save: the NEW SPAN only (append these frames after the saved run's frames)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "filename_prefix": "audio/cont/CLSSH3",
+      "format": "flac",
+      "audio": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save the continuation audio (append after the saved run's audio)"
+    }
+  },
+  "16": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "Sigma shift 12/6"
+    }
+  },
+  "23": {
+    "inputs": {
+      "tau_c": 0.05,
+      "beta": 0.4,
+      "overlap": 7,
+      "ema_mean_max": 0.25
+    },
+    "class_type": "CLSSH3Config",
+    "_meta": {
+      "title": "CLSS config - overlap must match the saved run's config"
+    }
+  },
+  "30": {
+    "inputs": {
+      "num_chunks": 1,
+      "upscale_scale": 1.5,
+      "fps": 24,
+      "detail_anchor": "on",
+      "audio_xfade_ms": 0,
+      "audio_join_lead_ms": 0,
+      "scene_handoff": "hard",
+      "tail_margin_px": 12,
+      "guider": [
+        "12",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "noise": [
+        "10",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ],
+      "clss_config": [
+        "23",
+        0
+      ],
+      "audio_config": [
+        "31",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "continuation_context": [
+        "33",
+        0
+      ]
+    },
+    "class_type": "CLSSH3StreamingSampler",
+    "_meta": {
+      "title": "CLSS H3 Streaming Sampler - 4 NEW chunks (~40 s) continued from node 33's context"
+    }
+  },
+  "31": {
+    "inputs": {
+      "audio_recompose_steps": 0,
+      "audio_recompose_sigma": 1,
+      "audio_arc_margin_ms": 0,
+      "audio_recompose_pool": 2,
+      "audio_recompose_stride": 2,
+      "audio_recompose_seed": 0,
+      "audio_recompose_ref_ms": 0,
+      "audio_head_discard_ms": 0,
+      "loop_guard_rerolls": 2,
+      "loop_guard_wc": 0.99,
+      "loop_guard_loop": 0.7,
+      "loop_guard_retry_ref_ms": 2000
+    },
+    "class_type": "CLSSH3AudioConfig",
+    "_meta": {
+      "title": "Audio settings (recompose off; defaults = production)"
+    }
+  },
+  "33": {
+    "inputs": {
+      "filename_prefix": "clss_h3/CLSSH3_frame_",
+      "scene_index": 1,
+      "audio_prefix": "",
+      "latent": [
+        "7",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "clss_config": [
+        "23",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ContinueFromVideo",
+    "_meta": {
+      "title": "Continue from the saved run: point both prefixes at the finished run's decode/save nodes"
+    }
+  },
+  "34": {
+    "inputs": {
+      "ref_image_size": "match",
+      "audio_seconds_per_scene": 10,
+      "width": [
+        "40",
+        0
+      ],
+      "height": [
+        "40",
+        1
+      ],
+      "conditioning": [
+        "5",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "38",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "37",
+        0
+      ],
+      "ref_images.ref_image_2": [
+        "39",
+        0
+      ],
+      "ref_audios.ref_audio_0": [
+        "36",
+        0
+      ]
+    },
+    "class_type": "CLSSH3SceneReferencesAll",
+    "_meta": {
+      "title": "CLSS H3 Scene References (R2V all scenes)"
+    }
+  },
+  "36": {
+    "inputs": {
+      "audio": "audio_minimax_music3_00041.mp3"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "Load Audio"
+    }
+  },
+  "37": {
+    "inputs": {
+      "image": "Gemini_Generated_Image_n14zm6n14zm6n14z.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "38": {
+    "inputs": {
+      "image": "Gemini_Generated_Image_kujj0ikujj0ikujj.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "39": {
+    "inputs": {
+      "image": "Gemini_Generated_Image_r8c807r8c807r8c8.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "40": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.5,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "Resolution Selector (Size)"
+    }
+  },
+  "41": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "Model Attention Backend"
+    }
+  },
+  "42": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength": 1,
+      "low_vram": false,
+      "model": [
+        "41",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo LoRA"
+    }
+  }
+}

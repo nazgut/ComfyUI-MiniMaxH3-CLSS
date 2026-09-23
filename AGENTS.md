@@ -77,7 +77,7 @@ weights**:
 ## Repository layout
 
 ```
-nodes.py     # all 9 ComfyUI node implementations (incl. R2V scene-reference nodes:
+nodes.py     # all 12 ComfyUI node implementations (incl. R2V scene-reference nodes:
              # CLSSH3SceneReference single + CLSSH3SceneReferences V3-Autogrow multi,
              # re-tokenizing one scene's text with minimax_ref_items so <Picture N>/
              # <Audio N> labels bind per scene; CLSSH3SceneReferencesAll applies
@@ -109,7 +109,49 @@ nodes.py     # all 9 ComfyUI node implementations (incl. R2V scene-reference nod
              # guard: sim/sim_ref_order.py. NEVER prepend a ref. AND the tail
              # ref is attached ONLY on chunks whose scene has NO audio ref
              # (owner directive 2026-09-18) — ref'd scenes take their audio
-             # from <Audio j>; the video continuation is unaffected.
+             # from <Audio j>; the video continuation is unaffected.)
+             # CLSSH3ContinueFromVideo + CLSSH3ReeditChunk (RUN CONTINUATION /
+             # RE-EDIT): re-encode a SAVED run's own frames (its decode-save
+             # prefix under output/) into a CLSS_CONTEXT for the sampler — the
+             # last overlap frames + the audio tail for continue, or chunk k's
+             # surrounding frames (+ first/last frame pins from the saved
+             # pixels, the overlap audio before the chunk, and an optional
+             # strided video ref of the saved window) for re-edit. With a
+             # context the sampler OPENS ON A CONTINUATION WINDOW: context rows
+             # keyframed AND seeded at tau_v, the saved audio as the tail ref,
+             # delivery = the new span only (continue, see the HEAD RULE and
+             # HEAD TRIM below) / the chunk's span including the head (re-edit,
+             # so it drops back into the saved video).
+             # HEAD RULE (2026-09-22): a context run has no piece head, so the
+             # first delivered window re-covers the saved run's LAST 2 CONTEXT
+             # TOKENS (5 px / 0.21 s) as its head and the audio join cut moves
+             # to px ov-5. The model maps window tokens with (1,4,4,4,4)
+             # anchored at the WINDOW start (model.py _video_t_grid), the VAE
+             # decodes the assembled latent from the PIECE start
+             # (decode_output_shape: 72 tok -> 243 px); tokens ov-2/ov-1 carry
+             # model spans (1,4) - exactly the decode spans of assembled
+             # positions 0/1 - and every later token then agrees (window phase
+             # ov%5 == the assembled phase 2 that the 72-token first window
+             # establishes). Without the head every 5th delivered token renders
+             # at the wrong span (4->1 then 1->4) = a 17-frame stutter/freeze
+             # cycle. So chunk 1 delivers 243 px (head + 238 new) and chunks
+             # 2+ deliver 238 px; a re-edit span is [boundary-5, boundary+238)
+             # and the pins sit at its edges (window px 17 / 259). HEAD TRIM
+             # (owner report 2026-09-22: "now we have repeated last 5 images"):
+             # the head stays in the DECODED stream (the phase needs it) but the
+             # CONTINUE output must not repeat it, so CLSSH3ContinueFromVideo
+             # marks the context trim_head=True and decode-save drops the first
+             # 5 frames plus the first 8.67 af (head_af + 5 px = 6933 smp; the
+             # audio is then padded/truncated to the trimmed span's law) — the
+             # saved take starts at the new span, nothing to trim by hand.
+             # CLSSH3ReeditChunk sends trim_head=False: its head IS the span it
+             # replaces. The plan is
+             # bit-identical to the frozen implementation for the no-context
+             # path; sim/sim_continue.py pins the plan table, the
+             # spans/pins, slice math and the on-disk naming (frames are
+             # written as <prefix-basename>_<idx:05d>.png, i.e. a prefix that
+             # already ends in '_' yields a DOUBLE underscore). Workflows:
+             # workflow/continue_minimaxh3_clss.json + reedit_minimaxh3_clss.json.
              # CLSSH3LoadLatentUpscaleModel + the sampler's per-chunk upscaler,
              # which SOFT-IMPORT their model module by file path at execute time
              # from sibling custom_nodes/*/nodes/minimax_h3_latent_upscaler_3d.py
@@ -119,15 +161,43 @@ clss.py      # model-agnostic CLSS core: CLSSConfig, CLSSState (SLB, EMA/AdaIN
 __init__.py  # node-mapping exports only
 workflow/    # canonical workflows (API format): t2v_minimaxh3_clss.json (text-to-video),
              # i2v_minimaxh3_clss.json (first-frame guide via the sampler's image/vae
-             # inputs) and ref2v_minimaxh3_clss.json (CLSSH3SceneReferencesAll R2V refs)
-             # — all on the validated stack: 832x480, 243 px windows, 10 chunks,
-             # 20 steps, shift 12/6, audio_cfg 4, tail_margin 12, audio_config wired.
+             # inputs), ref2v_minimaxh3_clss.json (CLSSH3SceneReferencesAll R2V refs),
+             # continue_minimaxh3_clss.json (keep generating a finished run: context =
+             # the saved run's own tail) and reedit_minimaxh3_clss.json (re-render ONE
+             # chunk of a finished run: context + first/last frame pins + optional
+             # video ref; built from the SAME graph as continue - the owner's turbo R2V
+             # production stack, only node 33 swapped and the output prefixes moved to
+             # clss_h3/reedit/ + audio/reedit/). EVERY sampler run first calls
+             # `_unload_before_sampling` (mm.unload_all_models + soft_empty_cache,
+             # printed with the GB freed) BEFORE the first DiT load: a resident-mode
+             # ClipProj text encoder is pinned and ComfyUI's own eviction no-ops for
+             # it, but the pack hooks `unload_all_models()` to release the pins for
+             # real (its log: "... unloaded (10.23 GB freed)") - so the encoder
+             # leaves the card right after the text encode instead of OOMing the
+             # DiT load (owner OOM 2026-09-22 with the 8B encoder: 10.23 GB pinned
+             # + DiT > 15.6 GB). No extra node in the graphs. The sampler also
+             # enables CUDA "expandable_segments" at runtime when
+             # PYTORCH_CUDA_ALLOC_CONF lacks it and prints the allocator state
+             # (`_enable_expandable_segments`): the 0.8 MP CONTINUITY OOM
+             # (2026-09-23) was fragmentation (4.26 GiB reserved-but-unallocated
+             # vs a 4.23 GiB request) while same-size FRESH runs completed -
+             # continuity's packed sequence is ~15% longer (81-token window =
+             # 7 ctx + 70 new + 4 margin = 273 px, plus 7 keyframe frames; fresh =
+             # 76 tok / 256 px, no keyframes). Full fix = the env var at start.
+             # t2v/i2v/ref2v stay on the validated
+             # stack: 832x480, 243 px windows, 20 steps, shift 12/6, audio_cfg 4,
+             # tail_margin 12, audio_config wired (10 chunks for t2v/i2v/ref2v, 1 for
+             # continue/reedit as saved).
              # The audio-lab files are generated on demand: sim/make_audio_lab.py
              # writes workflow/audio_lab_minimaxh3_clss.json (driver: t2v).
              # RULE: every experiment copies the canonical file — never mutate it in place.
 sim/         # offline harnesses (no model): sim_tau_c, sim_geometry, sim_mean_drift,
-             # sim_splice, sim_audio_refresh, sim_ref_window_drift
+             # sim_splice, sim_audio_refresh, sim_preunload, sim_ref_window_drift
              # (per-scene ref-audio windows vs the piece's scene grid) +
+             # sim_continue (continuation/re-edit context: plan table vs the frozen
+             # no-context implementation, grid identity that forbids the 17k+5 head
+             # on a context window, delivery/cut/splice arithmetic, re-edit spans +
+             # pins, video-ref clip length, audio slice law, frame-file loading) +
              # sim_video_ref_span (Motion Video Context: a strided recompose video
              # ref must sit on the target time grid — nodes._mc_fixup_video) +
              # sim_loop_guard (a recompose take that measures as a self-repeating
@@ -178,7 +248,14 @@ CLSSH3AudioConfig                          → CLSS_AUDIO_CONFIG (ALL audio sett
 CLSSH3LoadLatentUpscaleModel               → LATENT_UPSCALER (optional; soft-imports
                                              the sibling upscaler pack's 3D module)
 KSamplerSelect + BasicScheduler + RandomNoise → SAMPLER / SIGMAS / NOISE
+CLSSH3ContinueFromVideo / CLSSH3ReeditChunk  → CLSS_CONTEXT (reads the SAVED run's
+                                             frames + audio from output/ by prefix;
+                                             wire into the sampler's
+                                             `continuation_context` — the run then
+                                             opens on a continuation window)
 CLSSH3StreamingSampler(...)                → LATENT  (chunked, full telemetry;
+                                             optional `continuation_context` =
+                                             continue/re-edit opening context;
                                              optional upscaler = per-chunk neural
                                              upscale after each SLB step; any
                                              slice of the 1.0→0.0 schedule)
@@ -267,6 +344,52 @@ JUSTIFICATION §26 + §27). Notable remaining sampler knobs: `detail_anchor` on
 `tail_margin_px` 12 (generated-but-not-delivered window tail, MD surplus
 parity — see above); `fps`
 forced to 24 with a warning (the 40-latent-fps audio math is hard-wired to 24).
+
+## Continuing and re-editing a saved run
+
+A finished run leaves everything needed to pick it up again: its PNG frames
+(`<output>/clss_h3/...`, written by `CLSSH3VideoDecodeSave`) and its audio
+(`<output>/audio/...`, written by the save-audio node). Two nodes turn that
+material back into conditioning context, and are read from disk by prefix —
+no loader nodes, no extra geometry to enter:
+
+- `CLSSH3ContinueFromVideo` — **continue the piece.** The last overlap token
+  span of frames (`_px_of_tokens(overlap, 0)` = 22 px at overlap 7) plus the
+  matching audio tail become the new run's opening context, so its first
+  window is a normal continuation window: the context rides as keyframe rows,
+  seeds the SLB at `tau_v`, and the saved audio tail is its tail ref. The
+  first delivered window carries the 2-token HEAD (the context's last 5 px,
+  see the HEAD RULE above): 243 px = 5 px re-covered + 238 px new; every later
+  chunk delivers 238 px (9.92 s). The HEAD TRIM (above) drops that 5 px from
+  the saved output — decode-save writes only the new span (frames + audio), so
+  the take appends after the saved run with nothing to trim. `num_chunks`
+  picks how much to add.
+- `CLSSH3ReeditChunk` — **fix one bad chunk.** Chunk k of the saved run is
+  rebuilt at its original span plus the same 5 px head: chunk 1 = `[0, 243)`,
+  chunk k>=2 = `[px0 + (k-2)*pxc - 5, +243)`. Chunks 2+ get the saved frames
+  before them as context (rows + audio tail ref); first/last frames of the
+  re-rendered span are pinned as clean keyframes (`pin_frames`, default
+  first+last) so it still meets its saved neighbours; `video_ref` (default
+  off) presents the saved window's own motion as a strided video ref. The
+  node reports `start_frame` and `frames` (the span to replace in the saved
+  sequence; the length is unchanged by the head); chunk 1 has no predecessor
+  and is rebuilt from its pins alone. With `num_chunks > 1` the re-render
+  simply keeps generating forward from the context — the pins anchor the
+  first window.
+
+Both nodes need the same `latent` template, `clss_config` (same overlap),
+`vae` and — for the audio context — `audio_vae` as the run they continue;
+their `filename_prefix` / `audio_prefix` are the exact strings the saved run's
+decode-save / save-audio nodes wrote. Both also take a `scene_index` (which
+prompt block the saved material belongs to — the sampler overrides the first
+window's scene with it, so multi-scene runs keep the right text; single-scene
+prompts leave 1). Conditions they check and report:
+missing frames (the span must exist), a context row count that differs from
+the run's overlap, an overlap clamped by the 12 s cap (rebuild the context),
+and a `latent` template off the 5k+2 grid. The saved run must also have been
+uniform (no window-cap auto-split) for the chunk index → frame index map to
+hold. Everything here is generation-path adjacent: validate live before
+shipping any change (sim/sim_continue.py covers the arithmetic only).
 
 ## Build, run, and test commands
 

@@ -100,11 +100,13 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/nazgut/ComfyUI-MiniMaxH3-CLSS.git
 ```
 
-Restart ComfyUI — no pip install step, no submodules. Three workflows ship in `workflow/`, all on the live-validated 16 GB reference config (832×480, 243 px ≈ 10 s chunk windows, 10 chunks ≈ 99 s, 20 steps, sigma shift 12/6, audio CFG 4):
+Restart ComfyUI — no pip install step, no submodules. Five workflows ship in `workflow/`, all on the live-validated 16 GB reference config (832×480, 243 px ≈ 10 s chunk windows, 20 steps, sigma shift 12/6, audio CFG 4):
 
-- [`t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json) — text-to-video: the canonical single-scene Ferrari driving shot.
+- [`t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json) — text-to-video: the canonical single-scene Ferrari driving shot (10 chunks ≈ 99 s).
 - [`i2v_minimaxh3_clss.json`](workflow/i2v_minimaxh3_clss.json) — image-to-video: `LoadImage` wired to the sampler's `image` + `vae` inputs pins the image as an H3 first-frame keyframe on chunk 0 (swap in your image and edit the prompt to match).
 - [`ref2v_minimaxh3_clss.json`](workflow/ref2v_minimaxh3_clss.json) — reference-to-video: one `CLSSH3SceneReferencesAll` node attaches the reference image(s) to every scene (`<Picture N>`); drop in a `ref_audio` track and it is auto-sliced 10 s per scene.
+- [`continue_minimaxh3_clss.json`](workflow/continue_minimaxh3_clss.json) — keep going: point `filename_prefix` / `audio_prefix` at a finished run's decode-save / save-audio prefixes and generate the next N chunks from its real tail (same prompt text, same template, same overlap). The output is the new span only — append it after the saved frames/audio.
+- [`reedit_minimaxh3_clss.json`](workflow/reedit_minimaxh3_clss.json) — fix one chunk without re-running the piece: pick `chunk_index`, `pin_frames` (first+last by default) anchors the saved seam frames, and optionally present the saved window as a video reference. The node reports which saved frames (`start_frame`, `frames`) to replace with the re-render.
 
 ## Nodes
 
@@ -117,6 +119,8 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 | **CLSS H3 Scene Reference (R2V)** | Attach one reference image and/or audio to one scene's conditioning (`<Picture N>` / `<Audio N>` labels) |
 | **CLSS H3 Scene References (R2V multi)** | All of one scene's refs in one node — V3 Autogrow sockets, up to 9 images + 3 audios, socket order = label order |
 | **CLSS H3 Scene References (R2V all scenes)** | One node for the whole scene list: every image attaches to all scenes; the ref audio is encoded into **guarded** per-scene windows and **cropped automatically** by the sampler to each scene's exact delivered span (no geometry to enter, nothing to wire on the sampler side; only a span outside the ±4 s guard falls back to a re-encode); replaces the per-scene chain |
+| **CLSS H3 Continue From Video** | Continue a finished run: reads its saved frames + audio by prefix, turns the last overlap span into the opening context (keyframe replay + SLB seed + audio tail ref) for the sampler's `continuation_context` input; the output is the new span only — the 2-token head the token grid needs is folded into the decoded stream and dropped at save (first 5 frames + 8.67 af of audio), so nothing needs trimming by hand |
+| **CLSS H3 Re-edit Chunk** | Re-render one chunk of a finished run at its exact original span, head included (context from the frames before it + first/last frame pins copied from the saved video, optional strided video ref of the saved window); outputs `start_frame` / `frames` so the re-render can replace that span in place |
 | **CLSS H3 Load Latent Upscale Model** | Loads a Minimax H3 latent-upscaler (3D) checkpoint from `models/latent_upscale_models` for the sampler's per-chunk upscale; the model code is soft-imported from the Comfyui_Minimax_h3_latent_Upscaler pack at execute time |
 | **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
@@ -131,9 +135,9 @@ EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelec
 ## Repository layout
 
 ```
-nodes.py     # all 9 ComfyUI node implementations
+nodes.py     # all 12 ComfyUI node implementations
 clss.py      # the model-agnostic CLSS algorithm core (SLB, EMA/AdaIN drift correction)
-workflow/    # canonical t2v / i2v / R2V workflows — copy them for experiments, don't mutate in place
+workflow/    # canonical t2v / i2v / R2V / continue / re-edit workflows — copy them for experiments, don't mutate in place
 ```
 
 ## Status
