@@ -31,12 +31,22 @@ class CLSSConfig:
 
     overlap_latent_frames: int = 8
     new_latent_frames: int = 13
+    overlap_evict_after: float = 0.0
+    step_cache_thresh: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.tau_c <= 1.0:
             raise ValueError(f"tau_c must be in [0, 1], got {self.tau_c}")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError(f"beta must be in [0, 1], got {self.beta}")
+        if not 0.0 <= self.overlap_evict_after < 1.0:
+            raise ValueError(
+                f"overlap_evict_after must be in [0, 1), got "
+                f"{self.overlap_evict_after}")
+        if not 0.0 <= self.step_cache_thresh <= 1.0:
+            raise ValueError(
+                f"step_cache_thresh must be in [0, 1], got "
+                f"{self.step_cache_thresh}")
 
 
 class _PerChannelEMA:
@@ -84,8 +94,11 @@ class _PerChannelEMA:
             cap = sig_cur * max_amplification
             target_std = torch.minimum(target_std, cap)
         std_mix = (1.0 - beta) * sig_cur + beta * target_std
-        mean_mix = ((1.0 - _MEAN_PULL) * mu_cur
-                    + _MEAN_PULL * self.mean.unsqueeze(1))
+        # beta scales the whole correction, mean anchor included: the pull
+        # rises from 0 (beta=0, early return above) to _MEAN_PULL (beta=1)
+        pull = beta * _MEAN_PULL
+        mean_mix = ((1.0 - pull) * mu_cur
+                    + pull * self.mean.unsqueeze(1))
         corrected = (x - mu_cur) / sig_cur * std_mix + mean_mix
         return corrected.view(C, B, F, H, W).permute(1, 0, 2, 3, 4).to(latent.dtype)
 

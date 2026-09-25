@@ -5,8 +5,11 @@ import dataclasses
 import math
 import os
 import time
+import uuid
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+# older torch releases only read the CUDA-specific name
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn.functional as F
@@ -83,12 +86,21 @@ def _unload_before_sampling() -> float | None:
         return None
 
 
+def _expandable_segments_on(conf: str) -> bool:
+    for _kv in str(conf).replace(";", ",").split(","):
+        _kv = _kv.strip()
+        if _kv.startswith("expandable_segments:"):
+            return _kv.rsplit(":", 1)[1].strip().lower() in ("1", "true", "yes")
+    return False
+
+
 def _enable_expandable_segments() -> str | None:
     if not torch.cuda.is_available():
         return None
     try:
-        conf = str(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
-        if "expandable_segments" in conf:
+        conf = (os.environ.get("PYTORCH_ALLOC_CONF")
+                or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or "")
+        if _expandable_segments_on(conf):
             return "env"
         torch.cuda.memory._set_allocator_settings(
             "expandable_segments:True")
@@ -330,6 +342,7 @@ _AUDIO_CFG_DEFAULTS = {
     "loop_guard_wc": 0.99,
     "loop_guard_loop": 0.70,
     "loop_guard_retry_ref_ms": 2000,
+    "loop_guard_draft_frac": 0.4,
 }
 _AUDIO_CFG_KEYS = tuple(_AUDIO_CFG_DEFAULTS)
 
@@ -376,21 +389,27 @@ def _post_process_audio_latent(
         b = boundary
         if b < smooth_half or b + smooth_half > T:
             continue
+        # snapshot the two seam frames: the loop writes b-1 and b at i=1, so
+        # reading audio_lat[..., b] / [..., b - 1] at i>=2 would blend toward
+        # already-mixed values instead of the original seam frames
+        _left = audio_lat[..., b - 1].clone()
+        _right = audio_lat[..., b].clone()
         for i in range(1, smooth_half + 1):
             alpha = i / (smooth_half + 1)
             prev = b - i
             nxt = b + i - 1
             audio_lat[..., prev] = (
-                (1.0 - alpha) * audio_lat[..., prev] + alpha * audio_lat[..., b]
+                (1.0 - alpha) * audio_lat[..., prev] + alpha * _right
             )
             audio_lat[..., nxt] = (
-                (1.0 - alpha) * audio_lat[..., nxt] + alpha * audio_lat[..., b - 1]
+                (1.0 - alpha) * audio_lat[..., nxt] + alpha * _left
             )
     return audio_lat
 
 
 _MC_AUDIO_KEY = "motion_context_audio_end_frame"
 _MC_VIDEO_KEY = "motion_context_video_stride"
+_EVICT_OFFSET_KEY = "clss_overlap_evict_offset_px"
 
 _MC_PATCHED = False
 _MC_FAILED = None
@@ -501,6 +520,28 @@ def _mc_fixup_video(layout, refs) -> None:
             f += 1
 
 
+def _evict_fixup(layout, keyframes) -> None:
+    marked = [kf for kf in (keyframes or ())
+              if kf.get(_EVICT_OFFSET_KEY) is not None]
+    if len(marked) != 1:
+        raise RuntimeError(
+            "expected exactly one overlap-eviction marker keyframe")
+    kf = marked[0]
+    if kf.get("latent") is not None or kf.get("audio_latent") is not None:
+        raise RuntimeError("overlap-eviction marker must not carry latents")
+    offset_px = float(kf[_EVICT_OFFSET_KEY])
+    if offset_px <= 0 or offset_px > 1e6:
+        raise RuntimeError(
+            f"overlap-eviction offset out of range: {offset_px} px")
+    a, b, kind = layout.segments[-1]
+    if kind != "video" or b <= a:
+        raise RuntimeError("PackedLayout target video is not the final segment")
+    # the shrunken window's default token grid equals the true grid shifted by
+    # offset_px, because the 2 kept overlap rows sit at phases 0/1 (1+4 px) —
+    # so a single uniform shift restores every row's true window time
+    layout.position_ids[a:b, 0] += FRAME_RESCALE * offset_px
+
+
 def _mc_apply_patch() -> bool:
     global _MC_PATCHED, _MC_FAILED
     if _MC_PATCHED:
@@ -531,6 +572,11 @@ def _mc_apply_patch() -> bool:
             _mc_fixup_video(self, refs)
         if refs and any(r.get(_MC_AUDIO_KEY) is not None for r in refs):
             _mc_fixup_audio(self, refs)
+        # eviction fixup must run last: the audio-ref fixup above anchors to
+        # the target origin, which the eviction shift moves on purpose
+        if keyframes and any(kf.get(_EVICT_OFFSET_KEY) is not None
+                             for kf in keyframes):
+            _evict_fixup(self, keyframes)
 
     try:
         probe = mm.PackedLayout.__new__(mm.PackedLayout)
@@ -557,6 +603,18 @@ def _mc_apply_patch() -> bool:
                    - float(probe.position_ids[va + 2 * _k, 0])) > 1e-6:
                 raise RuntimeError(
                     "Motion Video Context self-test position mismatch")
+        probe = mm.PackedLayout.__new__(mm.PackedLayout)
+        patched_init(probe, 7, 7, 2, 2, 16,
+                     keyframes=[{"resolved_frame_index": 0, "latent": None,
+                                 "audio_latent": None,
+                                 _EVICT_OFFSET_KEY: 10.0}])
+        va, vb, _vk = probe.segments[-1]
+        wanted = 7.0 + mm.FRAME_RESCALE * 10.0
+        if (_vk != "video" or vb - va != 7
+                or abs(float(probe.position_ids[va, 0]) - wanted) > 1e-6
+                or abs(float(probe.position_ids[va + 1, 0])
+                       - (wanted + mm.FRAME_RESCALE * 1.0)) > 1e-6):
+            raise RuntimeError("overlap eviction self-test position mismatch")
     except Exception as exc:
         _MC_FAILED = str(exc)
         print(f"[CLSS] WARNING: Motion Context layout patch self-test failed "
@@ -588,6 +646,12 @@ class CLSSH3Config:
                 "ema_mean_max": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05,
                                       "tooltip": "Mean anchor: how far the per-channel EMA mean may drift from chunk 0, in units of that channel's chunk-0 std. 0.25 bounds the mean within a quarter-sigma of chunk 0 while slow intentional changes still pass; 0 = uncapped.",
                                       }),
+                "overlap_evict_after": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.9, "step": 0.05,
+                                      "tooltip": "EXPERIMENTAL - two-phase overlap eviction (KV-cache analog): continuation chunks run this fraction of steps on the full window so the overlap rows absorb their context, then drop all but the last 2 overlap rows (frozen at the intermediate x0) and continue on the shrunken window, re-noised from that x0 with identical noise and true positional times via a PackedLayout position fixup (requires the Motion Context layout patch; auto-disabled without it). At the default 7-token overlap and 0.4, the last 60% of steps run with 5 fewer video rows. 0 = off. Skipped on first chunks, head-pin chunks and scene switches; the audio side is untouched.",
+                                      }),
+                "step_cache_thresh": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.3, "step": 0.01,
+                                      "tooltip": "EXPERIMENTAL step caching (TeaCache-style): when the sampler input has moved less than this relative L1 since the last computed step, the whole DiT forward is skipped and the previous prediction is reused. At 6-8 steps a value around 0.06 typically skips 1-3 steps per chunk (~20-45% faster); 0.10+ gets visibly softer. Never skips the first step, the low-sigma tail (last 20% of the schedule), or two steps in a row, and each chunk/recompose pass re-arms automatically. 0 = off.",
+                                      }),
             },
         }
     RETURN_TYPES = ("CLSS_CONFIG",)
@@ -595,7 +659,8 @@ class CLSSH3Config:
     FUNCTION = "build"
     CATEGORY = "MiniMaxH3-CLSS"
 
-    def build(self, tau_c, beta, overlap, ema_mean_max=0.25):
+    def build(self, tau_c, beta, overlap, ema_mean_max=0.25,
+              overlap_evict_after=0.0, step_cache_thresh=0.0):
         return (CLSSConfig(
             tau_c=tau_c,
             beta=beta,
@@ -604,6 +669,8 @@ class CLSSH3Config:
             ema_mean_max_drift=ema_mean_max,
             overlap_latent_frames=_snap_overlap(overlap),
             adain_max_amplification=1.2,
+            overlap_evict_after=overlap_evict_after,
+            step_cache_thresh=step_cache_thresh,
         ),)
 
 
@@ -661,6 +728,10 @@ class CLSSH3AudioConfig:
                     "default": 2000, "min": 0, "max": 8000, "step": 250,
                     "tooltip": 'Loop-guard rescue ref span: re-roll attempts rebuild the recompose audio ref at this span for that attempt only (the piece-level span stays untouched); 2000 ms is the take-class loop relaxer. 0 = off (seed-only re-rolls). The best-of pick is unchanged, so the original take survives unless the rescue measures better.',
                     }),
+                "loop_guard_draft_frac": ("FLOAT", {
+                    "default": 0.4, "min": 0.0, "max": 0.9, "step": 0.05,
+                    "tooltip": "Speculative draft screening for loop-guard re-rolls: every attempt first runs this fraction of the recompose steps as a cheap draft, the draft's x0 estimate is screened with the same aud_wc/aud_loop metrics, and only drafts that already measure as looping are abandoned early (a rejected draft costs the draft steps instead of a full take). Good drafts are continued on the rest of the schedule from their own x0 re-noised with the same seed, so an accepted attempt costs exactly one take as before. 0 = off. Needs loop_guard_rerolls > 0 and >= 3 recompose steps.",
+                    }),
             },
         }
     RETURN_TYPES = ("CLSS_AUDIO_CONFIG",)
@@ -673,7 +744,8 @@ class CLSSH3AudioConfig:
               audio_recompose_stride=2, audio_recompose_seed=0,
               audio_recompose_ref_ms=0, audio_head_discard_ms=0,
               loop_guard_rerolls=2, loop_guard_wc=0.99,
-              loop_guard_loop=0.70, loop_guard_retry_ref_ms=2000):
+              loop_guard_loop=0.70, loop_guard_retry_ref_ms=2000,
+              loop_guard_draft_frac=0.4):
         return ({
             "audio_recompose_steps": audio_recompose_steps,
             "audio_recompose_sigma": audio_recompose_sigma,
@@ -687,6 +759,7 @@ class CLSSH3AudioConfig:
             "loop_guard_wc": loop_guard_wc,
             "loop_guard_loop": loop_guard_loop,
             "loop_guard_retry_ref_ms": loop_guard_retry_ref_ms,
+            "loop_guard_draft_frac": loop_guard_draft_frac,
         },)
 
 
@@ -739,6 +812,12 @@ class CLSSH3ScenePrompts:
                 text2 = f"{text}\n\n{cont}"
                 encoded2 = clip.encode_from_tokens_scheduled(
                     clip.tokenize(text2))
+                if len(encoded2) != len(encoded):
+                    print(f"[CLSS] WARNING: the audio-continuity text changed "
+                          f"the scene's conditioning entry count "
+                          f"({len(encoded)} -> {len(encoded2)}) — entries "
+                          f"beyond {min(len(encoded), len(encoded2))} get no "
+                          f"continuity variant.")
                 for entry, e2 in zip(encoded, encoded2):
                     d2 = {k: v for k, v in e2[1].items()
                           if not str(k).startswith("clss_")}
@@ -1004,6 +1083,10 @@ def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
 
     tokens = clip.tokenize(text, minimax_ref_items=items)
     encoded = clip.encode_from_tokens_scheduled(tokens)
+    if len(encoded) != 1:
+        print(f"[CLSS] WARNING: scene {scene_index} encoded to "
+              f"{len(encoded)} conditioning entries — the refs attach to the "
+              f"first entry only.")
     nt, nd = encoded[0]
     nd = dict(nd)
     nd["minimax_refs"] = blocks
@@ -1282,6 +1365,7 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
     _audio_cfg = 1.0
     _rescale = 0.7
     _av_latent_shapes = None
+    _step_cache_thresh = 0.0
 
     def set_av_params(self, video_cfg, audio_cfg, rescale):
         self._video_cfg = video_cfg
@@ -1308,7 +1392,82 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
                               denoise_mask=denoise_mask, callback=callback,
                               disable_pbar=disable_pbar, seed=seed)
 
+    @staticmethod
+    def _sc_park(t):
+        # park the cached prediction on CPU: one packed x0 is hundreds of MB,
+        # and the PCIe round-trip on a cache hit costs ~50 ms against the
+        # 60-90 s forward it replaces
+        if isinstance(t, comfy.nested_tensor.NestedTensor):
+            return comfy.nested_tensor.NestedTensor(
+                tuple(u.to("cpu") for u in t.tensors))
+        return t.to("cpu")
+
+    @staticmethod
+    def _sc_unpark(t, device):
+        if isinstance(t, comfy.nested_tensor.NestedTensor):
+            return comfy.nested_tensor.NestedTensor(
+                tuple(u.to(device) for u in t.tensors))
+        return t.to(device)
+
     def predict_noise(self, x, timestep, model_options={}, seed=None):
+        thr = float(getattr(self, "_step_cache_thresh", 0.0))
+        if thr <= 0.0:
+            return self._predict_noise_impl(x, timestep, model_options, seed)
+        sigma = float(timestep.flatten()[0])
+        xx = (x.tensors[0]
+              if isinstance(x, comfy.nested_tensor.NestedTensor) else x)
+        # channel-mean fingerprint: ~130 KB instead of cloning the ~350 MB
+        # packed latent. RMS-normalized: the raw fingerprint is dominated by
+        # the sigma schedule's magnitude change between steps (rel came out
+        # 0.1-1.0 even when content barely moved); after normalization rel
+        # measures content movement, which is what the threshold means
+        fp = xx.float().mean(dim=-1)
+        fp = fp / fp.square().mean().sqrt().clamp(min=1e-8)
+        st = getattr(self, "_scache", None)
+        if st is None:
+            st = self._scache = {}
+        # a sigma jump up (new chunk/recompose/draft schedule) or a different
+        # pack shape (eviction phase switch) re-arms the cache automatically
+        if (st.get("sigma") is None or sigma > st["sigma"] + 1e-9
+                or st.get("shape") != tuple(fp.shape)):
+            if st.get("computes"):
+                _tot = st["computes"] + st["skips"]
+                print(f"[CLSS] step cache: skipped {st['skips']}/{_tot} "
+                      f"model evals ({100.0 * st['skips'] / _tot:.0f}%)")
+            st.clear()
+            st.update(sigma=None, fp=None, out=None, skips=0, computes=0,
+                      last_skipped=True, sigma_start=sigma,
+                      shape=tuple(fp.shape))
+        if st["fp"] is not None:
+            rel = float((fp - st["fp"]).abs().mean()
+                        / st["fp"].abs().mean().clamp(min=1e-8))
+            why = None
+            if rel >= thr:
+                why = f"rel {rel:.4f} >= thresh {thr}"
+            elif st["last_skipped"]:
+                why = "previous step was a skip"
+            elif sigma <= 0.2 * st["sigma_start"]:
+                why = "low-sigma tail step"
+            if why is None:
+                st["skips"] += 1
+                st["last_skipped"] = True
+                st["sigma"] = sigma
+                print(f"[CLSS] step cache: sigma={sigma:.4f} "
+                      f"rel={rel:.4f} < {thr} -> SKIP (reusing previous "
+                      f"prediction)")
+                return self._sc_unpark(st["out"], xx.device)
+            print(f"[CLSS] step cache: sigma={sigma:.4f} rel={rel:.4f} "
+                  f"-> compute ({why})")
+        else:
+            print(f"[CLSS] step cache: sigma={sigma:.4f} -> compute "
+                  f"(pass start, cache empty)")
+        out = self._predict_noise_impl(x, timestep, model_options, seed)
+        st.update(fp=fp, out=self._sc_park(out), sigma=sigma,
+                  last_skipped=False)
+        st["computes"] += 1
+        return out
+
+    def _predict_noise_impl(self, x, timestep, model_options={}, seed=None):
         positive = self.conds.get("positive", None)
         negative = self.conds.get("negative", None)
         is_nested = isinstance(x, comfy.nested_tensor.NestedTensor)
@@ -1343,6 +1502,102 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
         return _join(pred_v, pred_a)
 
 
+_ATTN_OVERRIDE_BACKENDS = ("sage", "flash", "xformers", "pytorch", "sub_quad")
+_ATTN_PROBE: dict[str, bool] = {}
+_ATTN_ACTIVE: set = set()
+_ATTN_PIP_HINT = {"sage": "pip install sageattention",
+                  "flash": "pip install flash-attn",
+                  "xformers": "pip install xformers"}
+
+
+def _attn_backend_fn(name: str):
+    """-> (fn | None, failure_reason | None)"""
+    try:
+        from comfy.ldm.modules import attention as _att
+    except ImportError:
+        return None, "could not import comfy.ldm.modules.attention"
+    fn = getattr(_att, "REGISTERED_ATTENTION_FUNCTIONS", {}).get(name)
+    if fn is None:
+        hint = _ATTN_PIP_HINT.get(name)
+        return None, (f"not registered by ComfyUI - the package is missing or "
+                      f"failed to import; fix: {hint}" if hint
+                      else "not registered by this ComfyUI build")
+    if name in _ATTN_PROBE:
+        return ((fn, None) if _ATTN_PROBE[name]
+                else (None, "failed the CUDA smoke test earlier this session"))
+    ok, err = False, "no CUDA device available for the smoke test"
+    if torch.cuda.is_available():
+        try:
+            # one-time smoke test in the exact calling convention the H3
+            # model uses: (1, heads, seq, head_dim) bf16, skip_reshape
+            q = torch.randn(1, 4, 64, 128, device="cuda",
+                            dtype=torch.bfloat16)
+            fn(q, q.clone(), q.clone(), 4, skip_reshape=True)
+            torch.cuda.synchronize()
+            ok = True
+        except Exception as exc:
+            err = f"CUDA smoke test failed: {exc!r}"
+    _ATTN_PROBE[name] = ok
+    return (fn if ok else None), (None if ok else err)
+
+
+def _make_attention_override(name: str):
+    backend, _reason = _attn_backend_fn(name)
+
+    def _override(orig_func, *args, **kwargs):
+        if backend is not None and _ATTN_PROBE.get(name, False):
+            try:
+                out = backend(*args, **kwargs)
+                if name not in _ATTN_ACTIVE:
+                    _ATTN_ACTIVE.add(name)
+                    print(f"[CLSS] attention override ACTIVE: {name} is "
+                          f"serving the DiT attention calls")
+                return out
+            except Exception:
+                _ATTN_PROBE[name] = False
+                print(f"[CLSS] WARNING: {name} attention failed mid-run; "
+                      f"falling back to the default backend for the rest of "
+                      f"the run.")
+                return orig_func(*args, **kwargs)
+        return orig_func(*args, **kwargs)
+
+    return _override
+
+
+class CLSSH3AttentionOverride:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": 'MODEL (MiniMax H3) to run on the alternative attention backend.'}),
+                "backend": (list(_ATTN_OVERRIDE_BACKENDS), {
+                    "default": "sage",
+                    "tooltip": "Attention backend for the DiT forward, wired through ComfyUI's per-model optimized_attention_override hook. sage = SageAttention INT8 (needs: pip install sageattention; the big win on Ampere/Ada cards such as the 3080 mobile, typically 1.3-1.8x on the attention part of every step). flash = FlashAttention 2 (needs flash-attn). xformers = memory-efficient attention (needs xformers). pytorch/sub_quad = stock backends (no speedup; for A/B testing). Unavailable or failing backends fall back to the stock one with a warning, never a crash.",
+                    }),
+            },
+        }
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "MiniMaxH3-CLSS"
+
+    def patch(self, model, backend):
+        fn, reason = _attn_backend_fn(backend)
+        if fn is None:
+            print(f"[CLSS] WARNING: attention backend '{backend}' unavailable "
+                  f"({reason}) - the model keeps its stock attention.")
+            return (model,)
+        patcher = model.clone()
+        to = patcher.model_options.setdefault("transformer_options", {})
+        to["optimized_attention_override"] = _make_attention_override(backend)
+        _ATTN_ACTIVE.discard(backend)  # reprint the heartbeat for this run
+        print(f"[CLSS] attention override: {backend} backend armed for every "
+              f"DiT attention call of this model (confirm with the ACTIVE "
+              f"heartbeat once sampling starts)")
+        return (patcher,)
+
+
+
 class CLSSH3Guider:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1371,6 +1626,51 @@ class CLSSH3Guider:
         guider = _GuiderCLSSH3(model)
         guider.set_conds(positive, negative)
         guider.set_av_params(video_cfg, audio_cfg, rescale)
+        return (guider,)
+
+
+class CLSSH3BaseRefineGuider:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":    ("MODEL",        {"tooltip": 'The SAME MODEL the main guider uses (turbo LoRA applied). This node clones the patcher and strips the LoRA weight patches, so the recompose pass runs on base weights without a second checkpoint: ComfyUI hot-swaps the shared weights in place (patches_uuid mismatch re-patch) instead of loading another copy. One checkpoint in RAM/VRAM total.'}),
+                "positive": ("CONDITIONING", {"tooltip": 'The same positive CONDITIONING wired to the main guider.'}),
+                "negative": ("CONDITIONING", {"tooltip": 'The same negative CONDITIONING wired to the main guider.'}),
+                "audio_cfg": ("FLOAT", {
+                    "default": 4.0, "min": 1.0, "max": 30.0, "step": 0.5,
+                    "tooltip": 'Audio CFG scale of the recompose take. 1.0 = off; the canonical audio recipe runs 4.0. Video CFG stays 1.0 (H3 is CFG-distilled on the video side).',
+                }),
+                "rescale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
+                                      "tooltip": "Per-stream CFG rescale toward the conditional prediction's std (factor = r*std_ratio + 1-r, clamped to [0.5, 2.0]). 0 = off. Counteracts CFG oversaturation.",
+                                      }),
+            },
+        }
+    RETURN_TYPES = ("GUIDER",)
+    RETURN_NAMES = ("guider",)
+    FUNCTION = "get_guider"
+    CATEGORY = "MiniMaxH3-CLSS"
+
+    def get_guider(self, model, positive, negative, audio_cfg, rescale):
+        patcher = model.clone()
+        n_stripped = sum(len(v) for v in patcher.patches.values())
+        patcher.patches = {}
+        # a fresh uuid makes the loader see a patch-set mismatch against the
+        # main patcher on every pass swap, so it restores the shared weights
+        # from the backup and re-applies in place - no second checkpoint
+        patcher.patches_uuid = uuid.uuid4()
+        if n_stripped == 0:
+            print("[CLSS] WARNING: base refine guider: the wired MODEL "
+                  "carries no weight patches to strip - it already IS the "
+                  "base model; a plain CLSSH3Guider does the same job.")
+        else:
+            print(f"[CLSS] base refine guider: stripped {n_stripped} weight "
+                  f"patch key(s) - the recompose pass hot-swaps the shared "
+                  f"weights to base and back, no second checkpoint loaded.")
+        guider = _GuiderCLSSH3(patcher)
+        guider.set_conds(positive, negative)
+        guider.set_av_params(1.0, audio_cfg, rescale)
+        guider._clss_weight_swap_of = model
         return (guider,)
 
 
@@ -1630,7 +1930,7 @@ class CLSSH3StreamingSampler:
                     "tooltip": 'DEPRECATED and ignored; kept only so older workflow files keep loading. The delivered seam is the sample-exact splice only.',
                     }),
                 "audio_refine_guider": ("GUIDER", {
-                    "tooltip": "Separate GUIDER for the audio recompose pass: wire a CLSSH3Guider built on the BASE model (no LoRA), with the same conditioning as the main guider. Only used when the audio config's recompose steps > 0.",
+                    "tooltip": "Separate GUIDER for the audio recompose pass: wire a CLSSH3Guider built on the BASE model (no LoRA), with the same conditioning as the main guider - or a CLSSH3BaseRefineGuider wired to the SAME LoRA model as the main guider, which strips the LoRA in a shared-weight clone and hot-swaps instead of loading a second checkpoint. Only used when the audio config's recompose steps > 0.",
                     }),
                 "scene_handoff": (["transition_chunk", "blend", "hard"], {
                     "default": "transition_chunk",
@@ -1706,6 +2006,7 @@ class CLSSH3StreamingSampler:
         loop_guard_wc = float(_aud["loop_guard_wc"])
         loop_guard_loop = float(_aud["loop_guard_loop"])
         loop_guard_retry_ref_ms = int(_aud["loop_guard_retry_ref_ms"])
+        loop_guard_draft_frac = float(_aud["loop_guard_draft_frac"])
         _tm_px_in = max(0, min(48, int(tail_margin_px)))
         _tm_lf, _tm_px = _tail_margin_tokens(tail_margin_px)
         _tm_af = int(round(_tm_px * FRAME_RESCALE)) if _tm_px > 0 else 0
@@ -1930,7 +2231,8 @@ class CLSSH3StreamingSampler:
               + f"| detail_anchor {detail_anchor} | clss "
               f"tau_c {getattr(clss_config, 'tau_c', '?')} "
               f"beta {getattr(clss_config, 'beta', '?')} "
-              f"mean_anchor 0.9±{getattr(clss_config, 'ema_mean_max_drift', '?')}"
+              f"mean_anchor {0.9 * float(getattr(clss_config, 'beta', 0.0)):.2f}"
+              f"±{getattr(clss_config, 'ema_mean_max_drift', '?')}"
               f"σ0 "
               f"overlap {clss_config.overlap_latent_frames}tok"
               + (f" | audio RECOMPOSE {audio_recompose_steps} steps from "
@@ -2002,8 +2304,11 @@ class CLSSH3StreamingSampler:
               f"({_p_acc / fps:.1f} s), scenes={num_scenes}")
 
         _noise_seed = getattr(noise, "seed", 0)
-        _cap_v = max(T_total, _NOISE_FIELD_CAP_TOK)
-        _cap_a = max(Ta_total, _NOISE_FIELD_CAP_AF)
+        # the caps LIMIT the field size (positions past the field fall back to
+        # per-chunk fresh noise in _SlicedNoise); max() here was inverted and
+        # forced a 40000-token fp32 CPU field (~6-16 GB RAM) on EVERY run
+        _cap_v = min(T_total, _NOISE_FIELD_CAP_TOK)
+        _cap_a = min(Ta_total, _NOISE_FIELD_CAP_AF)
         _noise_tmpl = torch.zeros(B, C_v, _cap_v, H, W)
         _full_noise_vid: torch.Tensor = noise.generate_noise({"samples": _noise_tmpl})
         del _noise_tmpl
@@ -2038,6 +2343,8 @@ class CLSSH3StreamingSampler:
         _hist_scene_start = 0
         _lg_fired_total = 0
         _lg_rerolls_total = 0
+        _lg_draft_aborts_total = 0
+        _lg_draft_saved_total = 0
         _s1_audio_freq_ref: list[float] | None = None
         _trend = {
             "vid_std": [], "vid_intra": [], "vid_bnd": [],
@@ -2078,6 +2385,7 @@ class CLSSH3StreamingSampler:
                 _origin_ref = None
                 _origin_layout = None
                 _s1_prev_vfeat = None
+                _slb_std_base = None  # don't lock scene N's overlap seed to scene 1's contrast
                 _hist_scene_start = len(acc_audio)
                 clss_state.reset_drift_refs()
             _prev_scene_idx = scene_idx
@@ -2109,10 +2417,12 @@ class CLSSH3StreamingSampler:
                         _slb_ctx = ((_slb_ctx.float() - _m) * _lock
                                     + _m).to(_slb_ctx.dtype)
                         _cfg_lock = f" lock={_lock:.3f}"
+            _replay_kfs: list[dict] = []
             if not is_first and not _scene_switch:
-                keyframes.extend(_build_video_context_keyframes(
+                _replay_kfs = _build_video_context_keyframes(
                     _slb_ctx if _slb_ctx is not None
-                    else clss_state.overlap_latent, chunk_overlap))
+                    else clss_state.overlap_latent, chunk_overlap)
+                keyframes.extend(_replay_kfs)
             if chunk_idx == 0 and _ctx_pins:
                 for _pin in _ctx_pins:
                     keyframes.append({"resolved_frame_index": int(_pin["index"]),
@@ -2135,6 +2445,8 @@ class CLSSH3StreamingSampler:
             elif not is_first and _scene_aud_n > 0:
                 _cfg_g = "audref=off(scene ref)"
             guider_chunk = copy.copy(guider)
+            guider_chunk._step_cache_thresh = float(
+                getattr(clss_config, "step_cache_thresh", 0.0))
             _cfg_s = f"acfg={getattr(guider_chunk, '_audio_cfg', '?')}"
             if keyframes or _aud_ref_blk is not None or num_scenes > 1:
                 _pos_entry = (_blend_scene_cond(pos_conds[_plan_entry[0]],
@@ -2177,9 +2489,14 @@ class CLSSH3StreamingSampler:
                                      (_eff_overlap - _head_lf) % 5)
             chunk_af = _af_of_px((0 if is_first else px_ol) + _win_new_px
                                  + _tm_px)
-            _Ta_ol_w = chunk_af - cur_new_af - _tm_af
             _b_af = (0.0 if is_first
                      else float(FRAME_RESCALE) * float(px_ol - _head_px))
+            # audio overlap rows = the non-delivered head of the window, i.e.
+            # exactly the rows dropped below (aud_drop = int(_b_af)); the old
+            # chunk_af - cur_new_af - _tm_af mixed three rounded af() values
+            # and could go negative (e.g. 22 px template + 1 px tail margin),
+            # crashing _SlicedNoise with a negative a_overlap
+            _Ta_ol_w = max(0, int(_b_af))
             _d_af = int(_b_af)
             _head_af = float(_b_af - _d_af)
             _fill_af = (_b_af + float(_cur_new_px) * float(FRAME_RESCALE)
@@ -2224,19 +2541,118 @@ class CLSSH3StreamingSampler:
                 a_pos=_aud_pos,
                 a_overlap=_Ta_ol_w,
             )
-            _, denoised = SamplerCustomAdvanced().sample(
-                noise=_chunk_noise,
-                guider=guider_chunk,
-                sampler=sampler,
-                sigmas=sigmas,
-                latent_image=chunk_latent,
-            )
+            # two-phase overlap eviction (KV-cache analog): run the first
+            # _evict_steps steps on the full window so every overlap row
+            # absorbs its context, then drop all but the last 2 overlap rows
+            # (phases 0/1 -> the shrunken grid is the true grid shifted by a
+            # uniform px_ol-5 offset, restored via the marker-keyframe layout
+            # fixup) and continue re-noised from the phase-A x0 with per-row
+            # identical noise
+            _evicted = False
+            _evict_steps = 0
+            _evict_frac = float(getattr(clss_config, "overlap_evict_after",
+                                        0.0))
+            _n_steps = int(sigmas.numel()) - 1
+            # head-pinned continuation chunks (2-token head re-render): the
+            # kept suffix IS the head - it stays FREE (delivered content),
+            # while on plain continuation chunks the kept suffix is frozen
+            # overlap context
+            _evict_head = _head_lf > 0
+            if (0.0 < _evict_frac < 1.0
+                    and not is_first
+                    and not _scene_switch
+                    and chunk_overlap > _MIN_OVERLAP_TOKENS
+                    and _n_steps >= 3 and _mc_apply_patch()):
+                _evict_steps = min(_n_steps - 1,
+                                   max(1, round(_n_steps * _evict_frac)))
+                _evicted = 0 < _evict_steps < _n_steps
+            if _evicted:
+                _nz_full = _chunk_noise.generate_noise(chunk_latent)
+                _nv_full, _na_full = _nz_full.unbind()
+                _, _pa = SamplerCustomAdvanced().sample(
+                    noise=_FreshAVNoise(_nv_full, _na_full,
+                                        seed=_noise_seed),
+                    guider=guider_chunk,
+                    sampler=sampler,
+                    sigmas=sigmas[:_evict_steps + 1],
+                    latent_image=chunk_latent,
+                )
+                _pa_vid, _pa_aud = _pa["samples"].unbind()
+                # phase-B rows: the 2 kept overlap rows (frozen at the
+                # phase-A x0 on plain continuations; FREE when they are the
+                # delivered head) + the new/tail rows continued from it
+                lat_vid_b = _pa_vid[:, :, chunk_overlap - 2:].to(
+                    device).clone()
+                mask_vid_b = torch.ones(1, 1, lat_vid_b.shape[2], 1, 1,
+                                        device=device)
+                if not _evict_head:
+                    mask_vid_b[:, :, :2] = 0.0
+                chunk_latent_b = {
+                    "samples": comfy.nested_tensor.NestedTensor(
+                        (lat_vid_b, _pa_aud.to(device).clone())),
+                    "noise_mask": comfy.nested_tensor.NestedTensor(
+                        (mask_vid_b, mask_aud)),
+                }
+                _evict_off_px = float(px_ol - _px_of_tokens(2, 0))
+                # replay pins for the 2 kept rows + any context pins (their
+                # keyframe times are absolute window times, unaffected by
+                # the target-row shift)
+                _kf_b = (list(_replay_kfs[-2:]) if _replay_kfs else []) \
+                    + list(keyframes[len(_replay_kfs):]) + [
+                    {"resolved_frame_index": 0, "latent": None,
+                     "audio_latent": None,
+                     _EVICT_OFFSET_KEY: _evict_off_px}]
+                _pos_b = {**guider_chunk.original_conds["positive"][0],
+                          "minimax_keyframes": _kf_b}
+                guider_chunk.original_conds = {
+                    **guider_chunk.original_conds, "positive": [_pos_b]}
+                _, denoised = SamplerCustomAdvanced().sample(
+                    noise=_FreshAVNoise(
+                        _nv_full[:, :, chunk_overlap - 2:].clone(),
+                        _na_full, seed=_noise_seed),
+                    guider=guider_chunk,
+                    sampler=sampler,
+                    sigmas=sigmas[_evict_steps:],
+                    latent_image=chunk_latent_b,
+                )
+                _tok_saved = ((chunk_overlap - 2) * (H // 2) * (W // 2)
+                              * (_n_steps - _evict_steps))
+                _tok_full = max(total_lf * (H // 2) * (W // 2)
+                                * _n_steps, 1)
+                print(f"[CLSS] chunk {chunk_idx + 1}: overlap eviction "
+                      f"{_evict_frac:.2f} - {_evict_steps}/{_n_steps} steps "
+                      f"on the full window, then {chunk_overlap - 2} overlap "
+                      f"rows evicted (2 kept "
+                      f"{'free - the delivered head' if _evict_head else 'frozen'}"
+                      f", time-shifted "
+                      f"{_evict_off_px:.0f}px) for the rest, saving "
+                      f"~{100.0 * _tok_saved / _tok_full:.0f}% of window "
+                      f"tokens")
+            else:
+                _, denoised = SamplerCustomAdvanced().sample(
+                    noise=_chunk_noise,
+                    guider=guider_chunk,
+                    sampler=sampler,
+                    sigmas=sigmas,
+                    latent_image=chunk_latent,
+                )
             vid_out, aud_out = denoised["samples"].unbind()
+            _vid_full = None
+            if _evicted:
+                # restore the full window for the consumers that expect the
+                # overlap span (recompose video ref, upscaler blend): the
+                # evicted rows' content is the overlap context itself
+                if has_slb and _slb_v.shape[2] >= chunk_overlap - 2:
+                    _ov_src = _slb_v[:, :, :chunk_overlap - 2]
+                else:
+                    _ov_src = _pa_vid[:, :, :chunk_overlap - 2].to(device)
+                _vid_full = torch.cat(
+                    [_ov_src.to(dtype=vid_out.dtype), vid_out], dim=2)
 
             if audio_recompose_steps > 0:
                 _rc_pool = max(1, int(audio_recompose_pool))
                 _rc_stride = max(1, int(audio_recompose_stride))
-                _vr = vid_out
+                _vr = _vid_full if _vid_full is not None else vid_out
                 if _rc_pool > 1:
                     _m = 2 * _rc_pool
                     _vr = _vr[..., :(_vr.shape[-2] // _m) * _m,
@@ -2270,14 +2686,19 @@ class CLSSH3StreamingSampler:
                                          device=device, dtype=vid_out.dtype)
                 _rc_seed = _rc_seed_for(audio_recompose_seed, _noise_seed,
                                         chunk_idx)
-                _rc_kf = ([{**kf, "latent": None} for kf in keyframes
-                           if kf.get("audio_latent") is not None] or None)
+                # the chunk's finished video already rides as the frozen
+                # video ref, and no keyframe built in this pack carries an
+                # audio_latent pin — the old filter (audio_latent is not None)
+                # could never match anything, so no keyframes carry over
+                _rc_kf = None
                 if audio_refine_guider is not None:
                     _rc_guider = copy.copy(audio_refine_guider)
                     _rc_base_conds = audio_refine_guider.original_conds
                 else:
                     _rc_guider = copy.copy(guider)
                     _rc_base_conds = guider.original_conds
+                _rc_guider._step_cache_thresh = float(
+                    getattr(clss_config, "step_cache_thresh", 0.0))
                 _rc_aud_in = (aud_out if _margin_af == 0
                               else F.pad(aud_out, (0, _margin_af)))
                 _rc_mask_a = torch.ones(1, 1, lanes_a, _rc_af,
@@ -2356,7 +2777,7 @@ class CLSSH3StreamingSampler:
                             [b for b in _rc_pe["minimax_refs"]
                              if b is not _rc_aud_ref_blk] + [_lg_ref_blk])
 
-                def _rc_take(_seed):
+                def _rc_take(_seed, _sigmas=None, _init_aud=None):
                     _g = torch.Generator(device="cpu").manual_seed(_seed)
                     _nz = _FreshAVNoise(
                         _dummy_vid.clone(),
@@ -2366,16 +2787,33 @@ class CLSSH3StreamingSampler:
                         seed=_seed)
                     _lat = {
                         "samples": comfy.nested_tensor.NestedTensor(
-                            (_dummy_vid.clone(), _rc_aud_in.clone())),
+                            (_dummy_vid.clone(),
+                             (_rc_aud_in if _init_aud is None
+                              else _init_aud).clone())),
                         "noise_mask": comfy.nested_tensor.NestedTensor((
                             torch.zeros(1, 1, _rc_lf, 1, 1, device=device),
                             _rc_mask_a)),
                     }
                     _, _ro = SamplerCustomAdvanced().sample(
                         noise=_nz, guider=_rc_guider, sampler=sampler,
-                        sigmas=_rcs, latent_image=_lat)
+                        sigmas=(_rcs if _sigmas is None else _sigmas),
+                        latent_image=_lat)
                     return _ro["samples"].unbind()[1]
 
+                # speculative draft screening: a re-roll attempt first runs a
+                # cheap draft prefix of the schedule; the draft's x0 estimate
+                # is metric-screened and only drafts that already measure as
+                # looping are abandoned early, while good drafts are continued
+                # on the rest of the schedule from that same x0 re-noised with
+                # the same seed (identical noise), so an accepted attempt
+                # costs exactly one full take as before
+                _draft_frac = float(loop_guard_draft_frac)
+                _draft_steps = 0
+                if (_lg_on and 0.0 < _draft_frac < 1.0
+                        and audio_recompose_steps >= 3):
+                    _draft_steps = min(
+                        audio_recompose_steps - 1,
+                        max(1, round(audio_recompose_steps * _draft_frac)))
                 _t_rc = time.time()
                 _lg_tries = []
                 _lg_shot = 0
@@ -2387,14 +2825,35 @@ class CLSSH3StreamingSampler:
                             "positive": [{**_rc_pe,
                                           "minimax_refs": _lg_refs_retry}]}
                         _lg_ref_used = True
-                    _take = _rc_take(_rc_seed_for(audio_recompose_seed,
-                                                  _noise_seed, chunk_idx,
-                                                  _lg_shot))
+                    _seed_shot = _rc_seed_for(audio_recompose_seed,
+                                              _noise_seed, chunk_idx,
+                                              _lg_shot)
+                    _draft_x0 = None
+                    if _draft_steps > 0:
+                        _draft_x0 = _rc_take(
+                            _seed_shot, _sigmas=_rcs[:_draft_steps + 1])
+                        _wc, _lp = _take_loop_metrics(
+                            _lg_hist, _draft_x0[..., _lg_lo:_lg_hi].cpu())
+                        if (_loop_guard_bad(_wc, _lp, _lg_thr_wc,
+                                            _lg_thr_loop)
+                                and _lg_shot < _lg_max):
+                            _lg_tries.append((_lg_shot, _wc, _lp, None,
+                                              (_draft_x0, _seed_shot)))
+                            _lg_draft_aborts_total += 1
+                            _lg_draft_saved_total += (
+                                audio_recompose_steps - _draft_steps)
+                            _lg_shot += 1
+                            continue
+                    _take = (_rc_take(_seed_shot,
+                                      _sigmas=_rcs[_draft_steps:],
+                                      _init_aud=_draft_x0)
+                             if _draft_x0 is not None
+                             else _rc_take(_seed_shot))
                     _wc = _lp = float("nan")
                     if _lg_on:
                         _wc, _lp = _take_loop_metrics(
                             _lg_hist, _take[..., _lg_lo:_lg_hi].cpu())
-                    _lg_tries.append((_lg_shot, _wc, _lp, _take))
+                    _lg_tries.append((_lg_shot, _wc, _lp, _take, None))
                     if (not _lg_on
                             or not _loop_guard_bad(_wc, _lp, _lg_thr_wc,
                                                    _lg_thr_loop)
@@ -2407,28 +2866,65 @@ class CLSSH3StreamingSampler:
                 if len(_lg_tries) > 1:
                     _lg_fired_total += 1
                     _lg_rerolls_total += len(_lg_tries) - 1
+                _lg_draft_done = -1
+                if _lg_tries[_lg_i][3] is None:
+                    # the best-of pick landed on an abandoned draft (its
+                    # draft metrics still beat every completed take) - finish
+                    # that draft's schedule from its own x0 with its own seed
+                    _fd_x0, _fd_seed = _lg_tries[_lg_i][4]
+                    _fd_take = _rc_take(_fd_seed,
+                                        _sigmas=_rcs[_draft_steps:],
+                                        _init_aud=_fd_x0)
+                    _fd_wc, _fd_lp = _take_loop_metrics(
+                        _lg_hist, _fd_take[..., _lg_lo:_lg_hi].cpu())
+                    _lg_tries[_lg_i] = (_lg_tries[_lg_i][0], _fd_wc,
+                                        _fd_lp, _fd_take,
+                                        _lg_tries[_lg_i][4])
+                    _lg_draft_done = _lg_tries[_lg_i][0]
                 if _lg_on:
                     _fmtl = lambda _v: ("nan" if _v != _v else f"{_v:.3f}")
                     _lg_msg = (f"[CLSS] chunk {chunk_idx + 1}: loop guard: "
                                + " | ".join(
-                                   f"try{a}: wc={_fmtl(_w)} loop={_fmtl(_l)}"
-                                   for a, _w, _l, _t in _lg_tries))
+                                   f"try{a}{'*' if _t is None else ''}: "
+                                   f"wc={_fmtl(_w)} loop={_fmtl(_l)}"
+                                   for a, _w, _l, _t, _p in _lg_tries))
                     if len(_lg_tries) > 1:
                         _lg_msg += (
                             f" -> kept try{_lg_tries[_lg_i][0]} (seed "
                             f"{_rc_seed_for(audio_recompose_seed, _noise_seed, chunk_idx, _lg_tries[_lg_i][0])}"
                             f", {len(_lg_tries) - 1}/{_lg_max} re-rolls)")
+                    if any(_t is None for _, _, _, _t, _p in _lg_tries):
+                        _lg_msg += " (* = bad draft rejected early)"
+                    if _lg_draft_done >= 0:
+                        _lg_msg += (f" [kept try{_lg_draft_done} was an "
+                                    f"early-rejected draft, continued to "
+                                    f"full after the pick]")
                     if _lg_ref_used:
                         _lg_msg += (f" [retry ref "
                                     f"{int(loop_guard_retry_ref_ms)}ms]")
                     print(_lg_msg)
                 aud_out = _lg_tries[_lg_i][3][..., :_win_af]
                 if audio_refine_guider is not None:
-                    comfy.model_management.unload_model_and_clones(
-                        audio_refine_guider.model_patcher)
-                    comfy.model_management.soft_empty_cache()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    _swap_of = getattr(audio_refine_guider,
+                                       "_clss_weight_swap_of", None)
+                    _shares_weights = (
+                        _swap_of is not None
+                        and audio_refine_guider.model_patcher.model
+                        is guider.model_patcher.model)
+                    if _shares_weights:
+                        # weight-swap guider (CLSSH3BaseRefineGuider): the
+                        # patcher shares the main model's weights and ComfyUI
+                        # re-patches them in place on the next pass via the
+                        # patches_uuid mismatch - unloading here would only
+                        # force the shared weights off the device and purge
+                        # the allocator caches between every chunk
+                        pass
+                    else:
+                        comfy.model_management.unload_model_and_clones(
+                            audio_refine_guider.model_patcher)
+                        comfy.model_management.soft_empty_cache()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 with torch.no_grad():
                     _rcm_cos = _aud_cos(_aud_pre_rc, aud_out)
                     _rcm_rms = float(
@@ -2443,8 +2939,9 @@ class CLSSH3StreamingSampler:
                       f"step) | audio vs turbo take cos={_rcm_cos:.3f} rms "
                       f"x{_rcm_rms:.2f}")
 
-            new_vid = vid_out[:, :, chunk_overlap - _head_lf:
-                              chunk_overlap - _head_lf + _cur_new_lf]
+            _src_off = ((0 if _evict_head else 2) if _vid_full is not None
+                        else chunk_overlap - _head_lf)
+            new_vid = vid_out[:, :, _src_off:_src_off + _cur_new_lf]
             corrected = clss_state.post_process(new_vid)
 
             _da_x = corrected.float()
@@ -2502,7 +2999,8 @@ class CLSSH3StreamingSampler:
             if _up_active:
                 _t_up0 = time.time()
                 _ov_hr = chunk_overlap - _head_lf
-                _up_in = torch.cat([vid_out[:, :, :_ov_hr], corrected],
+                _up_src = _vid_full if _vid_full is not None else vid_out
+                _up_in = torch.cat([_up_src[:, :, :_ov_hr], corrected],
                                    dim=2)
                 _up_hr = _ups.upscale(_up_in, _up_scale, device=_up_dev)
                 _dt_up = time.time() - _t_up0
@@ -2525,8 +3023,12 @@ class CLSSH3StreamingSampler:
 
             aud_drop = _d_af
             _splice_bad = False
-            if aud_drop > 0 and aud_out.shape[-1] < aud_drop:
-                aud_drop = 0
+            if aud_drop > 0 and aud_out.shape[-1] <= aud_drop:
+                # window shorter than the overlap: keep A/V sync by dropping
+                # as much overlap as the window holds (brief missing audio)
+                # instead of resetting to 0, which delivered the overlap
+                # span twice and drifted audio ahead of video per junction
+                aud_drop = max(0, int(aud_out.shape[-1]) - 1)
                 _splice_bad = True
             if not is_first and audio_head_discard_ms > 0:
                 _extra = min(int(round(audio_head_discard_ms
@@ -2714,7 +3216,10 @@ class CLSSH3StreamingSampler:
             _fp = F.avg_pool2d(_vr, 4)[:, 0].reshape(_vr.shape[0], -1)
             _fp = _fp - _fp.mean(dim=1, keepdim=True)
             _fp = _fp / _fp.norm(dim=1, keepdim=True).clamp(min=1e-6)
-            _lag = max(1, int(round(12.4 * 24 / (17.0 / 5))))
+            # "one chunk back" in latent tokens, from the actual plan
+            # (was a hardcoded ~88 tokens = only right for one geometry)
+            _lag = max(1, int(plan_tokens[1] if len(plan_tokens) > 1
+                              else plan_tokens[0]))
             if _fp.shape[0] > 2 * _lag + 2:
                 _c = (_fp[_lag:] * _fp[:-_lag]).sum(dim=1)
                 _cm, _cx = float(_c.mean()), float(_c.max())
@@ -2744,8 +3249,12 @@ class CLSSH3StreamingSampler:
                   f"{max(_aw[-6:]) if _aw else 0.0:.2f}")
         if _lg_fired_total:
             print(f"[CLSS] loop guard: re-rolled {_lg_fired_total} chunk(s), "
-                  f"{_lg_rerolls_total} extra take(s); kept the lowest "
+                  f"{_lg_rerolls_total} extra attempt(s); kept the lowest "
                   f"aud_wc per chunk")
+        if _lg_draft_aborts_total:
+            print(f"[CLSS] loop guard drafts: {_lg_draft_aborts_total} bad "
+                  f"draft(s) rejected early, saving "
+                  f"~{_lg_draft_saved_total} recompose step(s) of full takes")
         if _up_active:
             print(f"[CLSS] upscaler: {_n_up} chunk(s) upscaled in {_up_secs:.1f}s | "
                   f"output video {tuple(full_vid.shape)} "
@@ -2957,7 +3466,8 @@ class CLSSH3VideoDecodeSave:
             audio = _splice_delivered_audio(audio, _splice or {}, _spf,
                                             _trim_af)
         if _ends and len(_ends) >= 2:
-            _b0 = [0] + [int(round(af / 40.0 * vae_sr)) for af in _ends[:-1]]
+            _b0 = [0] + [int(round(af / float(AUDIO_LATENT_FPS) * vae_sr))
+                         for af in _ends[:-1]]
             _b0.append(int(audio.shape[-1]))
             _lvs = []
             for _i in range(len(_b0) - 1):
@@ -3311,6 +3821,7 @@ class CLSSH3ReeditChunk(io.ComfyNode):
 
 NODE_CLASS_MAPPINGS = {
     "CLSSH3Config":           CLSSH3Config,
+    "CLSSH3AttentionOverride": CLSSH3AttentionOverride,
     "CLSSH3AudioConfig":      CLSSH3AudioConfig,
     "CLSSH3ScenePrompts":     CLSSH3ScenePrompts,
     "CLSSH3SceneReference":   CLSSH3SceneReference,
@@ -3321,10 +3832,12 @@ NODE_CLASS_MAPPINGS = {
     "CLSSH3LoadLatentUpscaleModel": CLSSH3LoadLatentUpscaleModel,
     "CLSSH3StreamingSampler": CLSSH3StreamingSampler,
     "CLSSH3Guider":           CLSSH3Guider,
+    "CLSSH3BaseRefineGuider": CLSSH3BaseRefineGuider,
     "CLSSH3VideoDecodeSave":  CLSSH3VideoDecodeSave,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3Config":           "CLSS H3 Config",
+    "CLSSH3AttentionOverride": "CLSS H3 Attention Override (Sage/Flash)",
     "CLSSH3AudioConfig":      "CLSS H3 Audio Config",
     "CLSSH3ScenePrompts":     "CLSS H3 Scene Prompts",
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",
@@ -3335,5 +3848,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3LoadLatentUpscaleModel": "CLSS H3 Load Latent Upscale Model",
     "CLSSH3StreamingSampler": "CLSS H3 Streaming Sampler",
     "CLSSH3Guider":           "CLSS H3 Guider (Split AV CFG)",
+    "CLSSH3BaseRefineGuider": "CLSS H3 Base Refine Guider (weight-swap)",
     "CLSSH3VideoDecodeSave":  "CLSS H3 Video Decode+Save (streaming)",
 }
