@@ -34,7 +34,7 @@ handoff fade, join glide, attack tame and the junction-anchored level
 matcher (with its 6 dB content gate) are all removed — the matcher on
 2026-09-17 after it measured ducking the reference track's own section
 change by 16.7 dB
-- **Optional audio recompose** — per chunk, the generated audio is discarded and re-imagined from **pure noise** against the finished chunk video (downscaled frozen video reference + masked dummy target, so a step costs seconds instead of a full chunk), optionally by a separate **BASE-model** guider (`audio_refine_guider`). Fresh noise is what changes the take — re-noising measured cos 0.90–0.96, i.e. the same take — and turbo LoRAs are video-distilled, so recomposing with the turbo head re-cooks the same under-distilled audio. Off in the canonical workflows (`CLSSH3AudioConfig.audio_recompose_steps=0`); `sim/make_audio_lab.py` generates a lab driver that exercises it.
+- **Optional audio recompose** — per chunk, the generated audio is discarded and re-imagined from **pure noise** against the finished chunk video (downscaled frozen video reference + masked dummy target, so a step costs seconds instead of a full chunk), optionally by a separate **BASE-model** guider (`audio_refine_guider`). Fresh noise is what changes the take — re-noising measured cos 0.90–0.96, i.e. the same take — and turbo LoRAs are video-distilled, so recomposing with the turbo head re-cooks the same under-distilled audio. Off in the canonical workflows (`CLSSH3AudioConfig.audio_recompose_steps=0`); `sim/make_audio_lab.py` generates a lab driver that exercises it. Each take is measured for self-repetition; takes that read as a vamp are re-rolled (optional ref-span rescue) and the least-repetitive take is kept. The pass can run on the base weights without a second checkpoint via `CLSSH3BaseRefineGuider`.
 - **Split video/audio CFG** — H3 ships one scalar CFG over the packed AV output; the CLSS guider unpacks the stream and applies video_cfg / audio_cfg separately, with rescale, uniformly to every chunk. (The SLB overlap cancels out of the CFG direction, so high audio CFG at a join mainly amplifies the re-applied text prompt — measured to open a new musical section every chunk; keep `audio_cfg` at 1.0 unless experimenting.)
 - **Optional i2v first-frame guide** — an image input is VAE-encoded and pinned as a `minimax_keyframes` row at frame 0 of chunk 0 (H3-native first-frame conditioning)
 - **Per-scene R2V references** — H3's ref2va mechanism split by scene: reference images/audios bind to `<Picture N>` / `<Audio N>` labels in one scene's prompt and ride only that scene's chunks; the all-scenes node fans images out to every scene and cuts a soundtrack into consecutive per-scene windows
@@ -100,7 +100,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/nazgut/ComfyUI-MiniMaxH3-CLSS.git
 ```
 
-Restart ComfyUI — no pip install step, no submodules. Five workflows ship in `workflow/`, all on the live-validated 16 GB reference config (832×480, 243 px ≈ 10 s chunk windows, 20 steps, sigma shift 12/6, audio CFG 4):
+Restart ComfyUI — no pip install step, no submodules. Five workflows ship in `workflow/` — the t2v / i2v / R2V set on the live-validated 16 GB reference config (832×480, 243 px ≈ 10 s chunk windows, 20 steps, sigma shift 12/6, audio CFG 4), plus the continue / re-edit graphs built from the turbo R2V production stack:
 
 - [`t2v_minimaxh3_clss.json`](workflow/t2v_minimaxh3_clss.json) — text-to-video: the canonical single-scene Ferrari driving shot (10 chunks ≈ 99 s).
 - [`i2v_minimaxh3_clss.json`](workflow/i2v_minimaxh3_clss.json) — image-to-video: `LoadImage` wired to the sampler's `image` + `vae` inputs pins the image as an H3 first-frame keyframe on chunk 0 (swap in your image and edit the prompt to match).
@@ -114,16 +114,19 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 
 | Node | Purpose |
 |---|---|
-| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid) |
-| **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING; optional `global_text` prepended to every scene; stashes raw scene text for the ref nodes |
+| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid); optional experimental knobs, both default 0 (off): `overlap_evict_after` (two-phase overlap eviction) and `step_cache_thresh` (TeaCache-style step skipping) |
+| **CLSS H3 Audio Config** | All audio settings in one node — recompose steps/σ/arc margin/pool/stride/seed/ref span, head discard and the loop guard (re-rolls, thresholds, rescue ref span, draft screening); wire into the sampler's `audio_config` (the sampler's own audio widgets were removed) |
+| **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING; optional `global_text` prepended to every scene; optional `audio_continuity_text` swapped in only on chunks that carry the continuation ref; stashes raw scene text for the ref nodes |
 | **CLSS H3 Scene Reference (R2V)** | Attach one reference image and/or audio to one scene's conditioning (`<Picture N>` / `<Audio N>` labels) |
 | **CLSS H3 Scene References (R2V multi)** | All of one scene's refs in one node — V3 Autogrow sockets, up to 9 images + 3 audios, socket order = label order |
 | **CLSS H3 Scene References (R2V all scenes)** | One node for the whole scene list: every image attaches to all scenes; the ref audio is encoded into **guarded** per-scene windows and **cropped automatically** by the sampler to each scene's exact delivered span (no geometry to enter, nothing to wire on the sampler side; only a span outside the ±4 s guard falls back to a re-encode); replaces the per-scene chain |
 | **CLSS H3 Continue From Video** | Continue a finished run: reads its saved frames + audio by prefix, turns the last overlap span into the opening context (keyframe replay + SLB seed + audio tail ref) for the sampler's `continuation_context` input; the output is the new span only — the 2-token head the token grid needs is folded into the decoded stream and dropped at save (first 5 frames + 8.67 af of audio), so nothing needs trimming by hand |
 | **CLSS H3 Re-edit Chunk** | Re-render one chunk of a finished run at its exact original span, head included (context from the frames before it + first/last frame pins copied from the saved video, optional strided video ref of the saved window); outputs `start_frame` / `frames` so the re-render can replace that span in place |
 | **CLSS H3 Load Latent Upscale Model** | Loads a Minimax H3 latent-upscaler (3D) checkpoint from `models/latent_upscale_models` for the sampler's per-chunk upscale; the model code is soft-imported from the Comfyui_Minimax_h3_latent_Upscaler pack at execute time |
+| **CLSS H3 Attention Override (Sage/Flash)** | Run the DiT attention on SageAttention / FlashAttention 2 / xformers — or the stock pytorch / sub-quad backends for A/B — through ComfyUI's `optimized_attention_override` hook; the backend is smoke-tested once and falls back to the stock path with a warning when a package is missing or a call fails mid-run |
 | **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
+| **CLSS H3 Base Refine Guider (weight-swap)** | Guider for the audio recompose pass that runs on BASE weights without a second checkpoint: clones the turbo model and strips its LoRA patches in a shared-weight copy (ComfyUI re-patches in place on the pass swap); the sampler skips its between-chunks unload |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
 ```
@@ -135,7 +138,7 @@ EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelec
 ## Repository layout
 
 ```
-nodes.py     # all 12 ComfyUI node implementations
+nodes.py     # all 14 ComfyUI node implementations
 clss.py      # the model-agnostic CLSS algorithm core (SLB, EMA/AdaIN drift correction)
 workflow/    # canonical t2v / i2v / R2V / continue / re-edit workflows — copy them for experiments, don't mutate in place
 ```
@@ -145,6 +148,30 @@ workflow/    # canonical t2v / i2v / R2V / continue / re-edit workflows — copy
 Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL-4B text encoder, 832×480, 243 px windows, 20 steps, sigma shift 12/6). Audio seam continuity is measured, not guessed: the end-aligned guide takes cross-join correlation from 0.45 to 0.95+, and per-chunk telemetry (`aud_bnd` / `aud_dlv` / `aud_lvl` / …) localizes any remaining seam or drift issues. Defaults are the measured production config — read the tooltips before changing them.
 
 ## Updates
+
+**2026-09-25 — attention override, base refine guider, speed knobs, loop-guard drafts, hardening**
+
+- **`CLSSH3AttentionOverride`** — run the DiT on **SageAttention** / **FlashAttention 2** / **xformers** through ComfyUI's per-model `optimized_attention_override` hook (stock pytorch / sub-quad included for A/B). The backend is smoke-tested on your GPU once; a missing package or a failing call falls back to the stock attention with a log warning — never a crash. Typical measured win for SageAttention on Ampere/Ada: ~1.3–1.8× on the attention part of each step.
+- **`CLSSH3BaseRefineGuider`** — the audio recompose pass on **base weights without a second checkpoint**: clones the turbo model and strips its LoRA weight patches in a shared-weight copy (ComfyUI re-patches in place on the pass swap; the sampler skips its between-chunks unload for it). Wire it to `audio_refine_guider` in place of the second `CLSSH3Guider`.
+- **Experimental speed knobs, both default off** — `CLSSH3Config.overlap_evict_after` (two-phase overlap eviction: a continuation chunk runs the first fraction of its steps on the full window, then drops all but the last 2 overlap rows and continues on the shorter window, re-noised from the intermediate x0 with corrected positional times; auto-disabled without the included layout patch) and `CLSSH3Config.step_cache_thresh` (skip the whole DiT forward when the latent has barely moved since the last computed step — ~0.06 typically skips 1–3 steps per chunk; never the first step, the low-sigma tail or two steps in a row).
+- **Loop-guard drafts** — re-roll attempts first run a cheap draft (`CLSSH3AudioConfig.loop_guard_draft_frac`, default 0.4): a draft that already measures as a vamp is abandoned early; a good draft continues on the rest of the schedule from its own x0, so an accepted attempt still costs exactly one take.
+- **Hardening** — the seam crossfade snapshots the original seam frames (no progressive smearing across a multi-junction file); the CPU noise field is sized to the run instead of always the 40 k-token cap (several GB of RAM saved); a window shorter than the overlap drops only what it holds (audio no longer slides ahead of the video); scene switches no longer lock a scene's overlap contrast to the first scene's; both `PYTORCH_ALLOC_CONF` spellings are honored.
+
+**2026-09-23 — 16 GB memory hardening (unload before sampling, expandable segments)**
+
+- Every sampler run calls `unload_all_models` + a cache flush **before the DiT load** and prints the freed GB (`[CLSS] unloaded all models before sampling (X GB freed)`): a resident-mode ClipProj text encoder is pinned and ComfyUI's own eviction can't touch it, but the pack's unload hook releases it for real (measured: 10.23 GB freed; the 8B-encoder OOM was 10.23 GB pinned + the DiT). No extra node in the graphs.
+- The sampler enables CUDA `expandable_segments` at runtime when the environment doesn't and prints the allocator state. A 0.8 MP continuation OOM measured as allocator fragmentation (4.26 GiB reserved-but-unallocated against a 4.23 GiB request) while same-size fresh runs completed. For a clean start: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before launching ComfyUI.
+
+**2026-09-22 — continue & re-edit a saved run**
+
+- **`CLSSH3ContinueFromVideo`** — keep generating a finished run: reads its saved frames + audio by prefix, turns the last overlap span into the opening context (keyframe replay + SLB seed + audio tail ref) and delivers only the new span. The 5-px head the token grid needs is folded into the decoded stream and dropped at save (first 5 frames + 8.67 af of audio) — nothing to trim by hand.
+- **`CLSSH3ReeditChunk`** — rebuild ONE chunk at its original span (head included): context from the saved frames before it, first/last frames pinned from the saved pixels, optional strided video ref of the saved window; the node reports `start_frame` / `frames` so the re-render replaces exactly that span in the saved sequence.
+- Workflows: [`continue_minimaxh3_clss.json`](workflow/continue_minimaxh3_clss.json) / [`reedit_minimaxh3_clss.json`](workflow/reedit_minimaxh3_clss.json) — both nodes need only the saved `filename_prefix` / `audio_prefix`, the same template, overlap and VAE(s).
+
+**2026-09-20 — audio loop guard + a dedicated audio config node**
+
+- **`CLSSH3AudioConfig`** — all audio settings moved off the sampler onto one node (recompose steps/σ/arc margin/pool/stride/seed/ref span, head discard, loop guard); wire it into the sampler's `audio_config`. The sampler's own audio widgets were removed.
+- **Loop guard** — after each recompose take the delivered span is measured for within-chunk repetition (`aud_wc`) and cross-chunk looping (`aud_loop`); takes that measure as a vamp are re-rolled with the next seed (up to `loop_guard_rerolls`, default 2), optionally rebuilding the recompose ref at `loop_guard_retry_ref_ms` (default 2000 ms, the ear-validated rescue). The least-repetitive take is kept — the original survives unless a re-roll measures better. Skipped on scenes whose audio rides their own `<Audio j>` reference.
 
 **2026-09-17 — scene-grid ref-audio windows (drift fix, automatic)**
 
