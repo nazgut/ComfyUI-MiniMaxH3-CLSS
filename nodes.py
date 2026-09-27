@@ -21,7 +21,9 @@ import comfy.utils
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
-from comfy_extras.nodes_minimax_h3 import AUDIO_LATENT_FPS, FPS as _NATIVE_FPS
+from comfy_extras.nodes_minimax_h3 import (AUDIO_LATENT_FPS,
+                                           FPS as _NATIVE_FPS,
+                                           adapt_canvas as _adapt_canvas)
 
 try:
     from .clss import CLSSConfig, CLSSState
@@ -871,6 +873,117 @@ def _encode_ref_audio_pair(audio_vae, audio):
     return _encode_ref_audio_slice(audio_vae, waveform)
 
 
+_REF_VIDEO_MAX_FRAMES = 360      # 15 s at 24 fps
+_REF_VIDEO_SAMPLE_EVERY = 12     # Qwen sees ref videos at 2 fps (24 / 12)
+
+
+def _encode_ref_video_entry(vae, video_frames, audio_vae=None,
+                            soundtrack=None):
+    """Video ref -> one presentation entry: [<Audio j> label] + <Video k>
+    item at 2 fps, and ONE DiT block (video_audio when a soundtrack rides)."""
+    n = int(video_frames.shape[0])
+    if n < 5:
+        raise ValueError(
+            "a reference video needs at least 5 frames (~0.2 s at 24 fps)")
+    if n > _REF_VIDEO_MAX_FRAMES:
+        print(f"[CLSS] ref video: {n} frame(s) "
+              f"({n / float(_NATIVE_FPS):.1f}s) trimmed to "
+              f"{_REF_VIDEO_MAX_FRAMES} (~15s)")
+        n = _REF_VIDEO_MAX_FRAMES
+    while n % 17 != 5:
+        n -= 1
+    frames = video_frames[:n, ..., :3]
+    vh, vw = int(frames.shape[1]), int(frames.shape[2])
+    cw, ch = _adapt_canvas(vw, vh)
+    if vw * vh < cw * ch:
+        cw = max(32, round(vw / 32) * 32)
+        ch = max(32, round(vh / 32) * 32)
+    frames = comfy.utils.common_upscale(
+        frames.movedim(-1, 1), cw, ch, "lanczos", "disabled"
+    ).movedim(1, -1)
+    _idx = list(range(0, n, _REF_VIDEO_SAMPLE_EVERY))
+    items = []
+    if soundtrack is not None:
+        items.append({"type": "audio"})
+    items.append({"type": "video", "data": frames[_idx],
+                  "timestamps": [i / 2.0 for i in range(len(_idx))]})
+    z = vae.encode(frames)
+    if z.ndim != 5:
+        raise ValueError(f"the reference video encoded to {tuple(z.shape)}")
+    audio_latent, ref_audio_t = None, 0
+    if soundtrack is not None:
+        _, _ablk = _encode_ref_audio_pair(audio_vae, soundtrack)
+        audio_latent = _ablk["audio_latent"]
+        ref_audio_t = int(_ablk["ref_audio_t"])
+    print(f"[CLSS] ref video: {n} frame(s) ({n / float(_NATIVE_FPS):.2f}s) "
+          f"-> {cw}x{ch}px / {int(z.shape[2])} tok"
+          + (f" + soundtrack {ref_audio_t}af" if ref_audio_t else ""))
+    return {"items": items,
+            "block": {"kind": "video_audio" if ref_audio_t else "video",
+                      "latent_t": int(z.shape[2]),
+                      "latent_h": int(z.shape[3]),
+                      "latent_w": int(z.shape[4]),
+                      "ref_audio_t": ref_audio_t, "latent": z,
+                      "audio_latent": audio_latent}}
+
+
+def _ref_video_parts(value):
+    """A ref-video source -> (frames [T,H,W,C] | None, own soundtrack | None).
+
+    A VIDEO object is decoded via get_components() and resampled to 24 fps
+    when the source rate differs (the DiT reads the clip on the 24 fps /
+    17k+5 grid, so a 30/60 fps clip must not be stretched or inflated); an
+    IMAGE batch passes through as frames (assumed 24 fps); an AUDIO dict
+    passes through as audio only."""
+    if value is None:
+        return None, None
+    if hasattr(value, "get_components"):
+        comps = value.get_components()
+        frames = comps.images
+        audio = getattr(comps, "audio", None)
+        fps = float(getattr(comps, "frame_rate", 0.0) or 0.0)
+        n0 = int(frames.shape[0])
+        if fps > 0.01 and abs(fps - float(_NATIVE_FPS)) > 0.01 and n0 > 1:
+            n = max(1, int(round(n0 / fps * float(_NATIVE_FPS))))
+            idx = (torch.arange(n, dtype=torch.float64) * fps
+                   / float(_NATIVE_FPS)).round().clamp(0, n0 - 1).long()
+            print(f"[CLSS] ref video: {n0} frame(s) @ {fps:g} fps resampled "
+                  f"to {n} frame(s) @ {int(_NATIVE_FPS)} fps")
+            frames = frames[idx]
+        if not (isinstance(audio, dict)
+                and torch.is_tensor(audio.get("waveform"))
+                and int(audio["waveform"].shape[-1]) > 0):
+            audio = None
+        return frames, audio
+    if torch.is_tensor(value):
+        return value, None
+    return None, value
+
+
+def _resolve_ref_video(vae, video_value, explicit_audio, audio_vae):
+    """One ref_video slot -> entry: the source's own soundtrack attaches
+    automatically; an explicit ref_video_audio overrides it; without the
+    audio_vae the soundtrack is skipped with a warning (video still rides)."""
+    frames, auto_audio = _ref_video_parts(video_value)
+    if frames is None:
+        raise ValueError("a ref_video carries no frames — connect a VIDEO "
+                         "or an IMAGE batch")
+    if explicit_audio is not None:
+        exp_frames, exp_audio = _ref_video_parts(explicit_audio)
+        soundtrack = exp_audio if exp_frames is not None else explicit_audio
+        if soundtrack is None:
+            print("[CLSS] WARNING: ref_video_audio carries no audio — "
+                  "skipped.")
+    else:
+        soundtrack = auto_audio
+    if soundtrack is not None and audio_vae is None:
+        print("[CLSS] WARNING: the reference video carries audio but the "
+              "audio_vae input is not wired — the soundtrack is skipped.")
+        soundtrack = None
+    return _encode_ref_video_entry(vae, frames, audio_vae=audio_vae,
+                                   soundtrack=soundtrack)
+
+
 _SCENE_TRACK_KEY = "clss_ref_audio_track"
 _SCENE_WINDOW_KEY = "clss_scene_window"
 _SCENE_WIN0_KEY = "clss_scene_window_win0"
@@ -1055,9 +1168,32 @@ def _build_video_context_keyframes(context_latent: torch.Tensor | None,
     return out
 
 
-def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
-    if not new_pairs:
-        raise ValueError("connect at least one image and/or audio reference")
+def _ref_entries_from_lists(items, blocks):
+    entries: list[dict] = []
+    i = 0
+    for blk in blocks:
+        kind = blk.get("kind")
+        want = ["audio", "video"] if kind == "video_audio" else [kind]
+        got = [it.get("type") for it in items[i:i + len(want)]]
+        if got != want:
+            raise ValueError(
+                "the scene's reference presentation does not match its "
+                f"reference blocks (expected {want}, found {got}) — attach "
+                f"refs with the CLSS ref nodes only")
+        entries.append({"items": list(items[i:i + len(want)]), "block": blk})
+        i += len(want)
+    if i != len(items):
+        raise ValueError("the scene carries more reference items than blocks")
+    return entries
+
+
+_REF_ORDER_RANK = {"image": 0, "video": 1, "video_audio": 1, "audio": 2}
+
+
+def _attach_scene_refs(clip, conditioning, scene_index, new_entries):
+    if not new_entries:
+        raise ValueError("connect at least one image, video and/or audio "
+                         "reference")
     idx = scene_index - 1
     if not 0 <= idx < len(conditioning):
         raise ValueError(f"scene_index {scene_index} is out of range — the "
@@ -1069,17 +1205,14 @@ def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
                          "from CLSSH3ScenePrompts (the scene's raw text is "
                          "needed to re-tokenize it with the reference "
                          "presentation).")
-    prev_items = prev.get("clss_ref_items", [])
-    prev_blocks = prev.get("minimax_refs", [])
-    if len(prev_items) != len(prev_blocks):
-        raise ValueError("the scene already carries minimax_refs from a "
-                         "foreign node without the matching tokenizer "
-                         "presentation — attach refs with the CLSS ref "
-                         "nodes only")
-    pairs = list(zip(prev_items, prev_blocks)) + new_pairs
-    pairs.sort(key=lambda p: 0 if p[1]["kind"] == "image" else 1)
-    items = [p[0] for p in pairs]
-    blocks = [p[1] for p in pairs]
+    entries = _ref_entries_from_lists(prev.get("clss_ref_items", []),
+                                      prev.get("minimax_refs", []))
+    entries.extend(new_entries)
+    # stock ref2va presentation order: images, then videos (each soundtrack's
+    # <Audio j> label right before its video), then standalone audio
+    entries.sort(key=lambda e: _REF_ORDER_RANK.get(e["block"].get("kind"), 3))
+    items = [it for e in entries for it in e["items"]]
+    blocks = [e["block"] for e in entries]
 
     tokens = clip.tokenize(text, minimax_ref_items=items)
     encoded = clip.encode_from_tokens_scheduled(tokens)
@@ -1105,11 +1238,15 @@ def _attach_scene_refs(clip, conditioning, scene_index, new_pairs):
     out = list(conditioning)
     out[idx] = [nt, nd]
     ni = sum(1 for b in blocks if b["kind"] == "image")
-    na = sum(1 for b in blocks if b["kind"] == "audio")
+    nv = sum(1 for b in blocks if b["kind"] in ("video", "video_audio"))
+    na = sum(1 for b in blocks if b["kind"] in ("audio", "video_audio"))
     _labels = ([f"<Picture 1..{ni}>"] if ni else []) + \
+              ([f"<Video 1..{nv}>"] if nv else []) + \
               ([f"<Audio 1..{na}>"] if na else [])
     print(f"[CLSS] scene {scene_index}: R2V refs = {ni} image(s) + "
-          f"{na} audio(s) — labels {' / '.join(_labels) or 'none'}")
+          f"{na} audio(s)"
+          + (f" + {nv} video(s)" if nv else "")
+          + f" — labels {' / '.join(_labels) or 'none'}")
     return out
 
 
@@ -1150,13 +1287,16 @@ class CLSSH3SceneReference:
             raise ValueError("encoding a reference image needs the vae input")
         if audio is not None and audio_vae is None:
             raise ValueError("encoding a reference audio needs the audio_vae input")
-        new_pairs = []
+        new_entries = []
         if image is not None:
-            new_pairs.append(_encode_ref_image_pair(
-                vae, image, ref_image_size, width, height))
+            _item, _blk = _encode_ref_image_pair(
+                vae, image, ref_image_size, width, height)
+            new_entries.append({"items": [_item], "block": _blk})
         if audio is not None:
-            new_pairs.append(_encode_ref_audio_pair(audio_vae, audio))
-        return (_attach_scene_refs(clip, conditioning, scene_index, new_pairs),)
+            _item, _blk = _encode_ref_audio_pair(audio_vae, audio)
+            new_entries.append({"items": [_item], "block": _blk})
+        return (_attach_scene_refs(clip, conditioning, scene_index,
+                                   new_entries),)
 
 
 class CLSSH3SceneReferences(io.ComfyNode):
@@ -1167,14 +1307,14 @@ class CLSSH3SceneReferences(io.ComfyNode):
             node_id="CLSSH3SceneReferences",
             display_name="CLSS H3 Scene References (R2V multi)",
             category="MiniMaxH3-CLSS",
-            description="Attach multiple R2V reference images/audios to ONE scene's conditioning. ref_image_1..N -> <Picture 1..N>, ref_audio_1..M -> <Audio 1..M> in the scene's prompt text.",
+            description="Attach multiple R2V reference images / videos / audios to ONE scene's conditioning. ref_image_1..N -> <Picture 1..N>, ref_video_1..V -> <Video 1..V> (a VIDEO object or a 24 fps frame batch; a VIDEO's own soundtrack attaches automatically and ref_video_audio_N overrides it), ref_audio_1..M -> <Audio j> in the scene's prompt text.",
             inputs=[
                 io.Conditioning.Input("conditioning", tooltip='Per-scene CONDITIONING from CLSSH3ScenePrompts (directly or through other CLSS ref nodes).'),
-                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B). The scene's text is re-tokenized with the reference presentation so the <Picture N>/<Audio N> labels bind."),
+                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B). The scene's text is re-tokenized with the reference presentation so the <Picture N>/<Video N>/<Audio N> labels bind."),
                 io.Int.Input("scene_index", default=2, min=1, max=64,
                              tooltip="1-based scene these references belong to (scene 2 = the second '---' block). Only that scene's chunks carry the refs."),
-                io.Vae.Input("vae", optional=True, tooltip='Video VAE, needed when any ref_image is connected.'),
-                io.Vae.Input("audio_vae", optional=True, tooltip='Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio is connected.'),
+                io.Vae.Input("vae", optional=True, tooltip='Video VAE, needed when any ref_image or ref_video is connected.'),
+                io.Vae.Input("audio_vae", optional=True, tooltip='Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio or ref_video_audio is connected.'),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                     tooltip="Reference image sizing. match: aspect-preserving downscale (never upscale) to the generation's pixel area - set width/height to the generation canvas. max: 2048 px short edge, best identity fidelity, but ref tokens ride every chunk of the scene and can be several times slower."),
                 io.Int.Input("width", default=1344, min=32, max=8192, step=32, optional=True,
@@ -1187,8 +1327,16 @@ class CLSSH3SceneReferences(io.ComfyNode):
                         prefix="ref_image_", min=0, max=9)),
                 io.Autogrow.Input("ref_audios", optional=True,
                     template=io.Autogrow.TemplatePrefix(
-                        input=io.Audio.Input("ref_audio", tooltip='Reference audio (voice/beat/texture anchor). Socket order = <Audio N> order.'),
+                        input=io.Audio.Input("ref_audio", tooltip='Reference audio (voice/beat/texture anchor). Socket order = <Audio N> order (soundtracks count first).'),
                         prefix="ref_audio_", min=0, max=3)),
+                io.Autogrow.Input("ref_videos", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.MultiType.Input("ref_video", [io.Video, io.Image], tooltip="Reference video: a VIDEO object (its own soundtrack attaches automatically when the file has one) or an IMAGE batch of frames at 24 fps. Reference it in the scene text as <Video N> (1-based in socket order). VIDEO sources are resampled to 24 fps when needed; clips are trimmed to 15 s and snapped to the model's 17k+5 frame grid (>= 5 frames). Qwen sees the clip at 2 fps with per-pair midpoint timestamps; the full clip rides the DiT as a video reference block, so its internal timing stays true. Scale is the reference pipeline's canvas (never upscaled; capped at a 768 px short edge). Video ref tokens ride every chunk of the scene - keep clips short."),
+                        prefix="ref_video_", min=0, max=3)),
+                io.Autogrow.Input("ref_video_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.MultiType.Input("ref_video_audio", [io.Audio, io.Video], tooltip="Soundtrack of the same-numbered ref_video (ref_video_audio_1 belongs to ref_video_1): an AUDIO input, or a VIDEO whose audio track is used. Overrides the video's own soundtrack. It gets its own <Audio N> label immediately before that video's <Video N> and rides the payload as the video block's own audio stream, so the scene can take its audio from the clip. Scenes whose video carries a soundtrack skip the rolling continuation tail ref. Needs the audio_vae input - without it the soundtrack is skipped with a warning."),
+                        prefix="ref_video_audio_", min=0, max=3)),
             ],
             outputs=[io.Conditioning.Output(display_name="conditioning")],
         )
@@ -1197,25 +1345,46 @@ class CLSSH3SceneReferences(io.ComfyNode):
     @torch.inference_mode()
     def execute(cls, conditioning, clip, scene_index, vae=None, audio_vae=None,
                 ref_image_size="match", width=1344, height=768,
-                ref_images=None, ref_audios=None):
+                ref_images=None, ref_audios=None, ref_videos=None,
+                ref_video_audios=None):
         ref_images = {k: v for k, v in (ref_images or {}).items()
                       if v is not None}
         ref_audios = {k: v for k, v in (ref_audios or {}).items()
                       if v is not None}
+        ref_videos = {k: v for k, v in (ref_videos or {}).items()
+                      if v is not None}
+        ref_video_audios = {k: v for k, v in (ref_video_audios or {}).items()
+                            if v is not None}
         if ref_images and vae is None:
             raise ValueError("encoding reference images needs the vae input")
+        if ref_videos and vae is None:
+            raise ValueError("encoding reference videos needs the vae input")
         if ref_audios and audio_vae is None:
             raise ValueError("encoding reference audios needs the audio_vae input")
-        new_pairs = []
+        new_entries = []
         for name in sorted(ref_images,
                            key=lambda n: int(n.rsplit("_", 1)[-1])):
-            new_pairs.append(_encode_ref_image_pair(
-                vae, ref_images[name], ref_image_size, width, height))
+            _item, _blk = _encode_ref_image_pair(
+                vae, ref_images[name], ref_image_size, width, height)
+            new_entries.append({"items": [_item], "block": _blk})
+        for name in sorted(ref_videos,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            _idx = name.rsplit("_", 1)[-1]
+            new_entries.append(_resolve_ref_video(
+                vae, ref_videos[name],
+                ref_video_audios.get("ref_video_audio_" + _idx), audio_vae))
+        for name in sorted(ref_video_audios,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            _vid = "ref_video_" + name.rsplit("_", 1)[-1]
+            if _vid not in ref_videos:
+                print(f"[CLSS] WARNING: {name} has no matching {_vid} — "
+                      f"ignored.")
         for name in sorted(ref_audios,
                            key=lambda n: int(n.rsplit("_", 1)[-1])):
-            new_pairs.append(_encode_ref_audio_pair(audio_vae, ref_audios[name]))
+            _item, _blk = _encode_ref_audio_pair(audio_vae, ref_audios[name])
+            new_entries.append({"items": [_item], "block": _blk})
         return io.NodeOutput(
-            _attach_scene_refs(clip, conditioning, scene_index, new_pairs))
+            _attach_scene_refs(clip, conditioning, scene_index, new_entries))
 
 
 class CLSSH3SceneReferencesAll(io.ComfyNode):
@@ -1226,12 +1395,12 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
             node_id="CLSSH3SceneReferencesAll",
             display_name="CLSS H3 Scene References (R2V all scenes)",
             category="MiniMaxH3-CLSS",
-            description="All-scene R2V refs in one node: every ref_image attaches to ALL scenes ('---' blocks), and the ref audio is encoded into one GUARDED window per scene (T ± 4 s). The sampler re-cuts every window automatically to the piece's exact scene span at run start by cropping the guard — no geometry to enter anywhere, and no drift against the delivered timeline. Replaces chaining one CLSSH3SceneReferences per scene.",
+            description="All-scene R2V refs in one node: every ref_image and ref_video attaches to ALL scenes ('---' blocks), and the ref audio is encoded into one GUARDED window per scene (T ± 4 s). A ref_video takes a VIDEO object (its own soundtrack attaches automatically) or a 24 fps frame batch. The sampler re-cuts every window automatically to the piece's exact scene span at run start by cropping the guard — no geometry to enter anywhere, and no drift against the delivered timeline. Replaces chaining one CLSSH3SceneReferences per scene.",
             inputs=[
                 io.Conditioning.Input("conditioning", tooltip="Per-scene CONDITIONING from CLSSH3ScenePrompts - one entry per '---' block. Every scene is re-tokenized with its own reference presentation, so refs bind per scene."),
-                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B / ClipProj). Each scene's raw text is re-tokenized with that scene's <Picture N>/<Audio N> presentation; the text itself stays byte-identical."),
-                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when any ref_image is connected. Images are encoded once and the same latent is shared by every scene's block."),
-                io.Vae.Input("audio_vae", optional=True, tooltip='Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio is connected. Connected files are resampled to the VAE rate, concatenated in socket order, and encoded into one guarded window per scene. The sampler crops each window to the exact scene span automatically; its own audio_vae is only the fallback if a span falls outside the guard.'),
+                io.Clip.Input("clip", tooltip="CLIP (qwen3vl-32B / ClipProj). Each scene's raw text is re-tokenized with that scene's <Picture N>/<Video N>/<Audio N> presentation; the text itself stays byte-identical."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when any ref_image or ref_video is connected. Both are encoded once and the same block is shared by every scene."),
+                io.Vae.Input("audio_vae", optional=True, tooltip='Audio VAE (MiniMaxH3AudioVAE), needed when any ref_audio or ref_video_audio is connected. Connected files are resampled to the VAE rate, concatenated in socket order, and encoded into one guarded window per scene. The sampler crops each window to the exact scene span automatically; its own audio_vae is only the fallback if a span falls outside the guard.'),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                     tooltip="Reference image sizing, applied to every scene's copy. match: aspect-preserving downscale (never upscale) to the generation's pixel area - set width/height to the generation canvas. max: 2048 px short edge, best identity fidelity, but ref tokens ride every chunk of every scene and can be many times slower."),
                 io.Int.Input("width", default=1344, min=32, max=8192, step=32, optional=True,
@@ -1248,6 +1417,14 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Audio.Input("ref_audio", tooltip="Reference audio (voice/beat/texture anchor). All connected files are concatenated in socket order, then cut into per-scene windows - each scene's window is its own <Audio 1>."),
                         prefix="ref_audio_", min=0, max=3)),
+                io.Autogrow.Input("ref_videos", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.MultiType.Input("ref_video", [io.Video, io.Image], tooltip="Reference video: a VIDEO object (its own soundtrack attaches automatically when the file has one) or an IMAGE batch of frames at 24 fps. Attached to EVERY scene; reference it as <Video N> in each scene's text. VIDEO sources are resampled to 24 fps when needed; clips are trimmed to 15 s and snapped to the model's 17k+5 frame grid (>= 5 frames). Qwen sees the clip at 2 fps with per-pair midpoint timestamps; the full clip rides the DiT as a video ref block, so its internal timing stays true. Encoded once, shared by all scenes. Scale is the reference pipeline's canvas (never upscaled; capped at a 768 px short edge). Video ref tokens ride every chunk of every scene - keep clips short."),
+                        prefix="ref_video_", min=0, max=3)),
+                io.Autogrow.Input("ref_video_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.MultiType.Input("ref_video_audio", [io.Audio, io.Video], tooltip="Soundtrack of the same-numbered ref_video (ref_video_audio_1 belongs to ref_video_1): an AUDIO input, or a VIDEO whose audio track is used. Overrides the video's own soundtrack. Each scene's copy gets its own <Audio N> label immediately before the video's <Video N> and rides the payload as the video block's own audio stream, so scenes can take their audio from the clip. Scenes whose video carries a soundtrack skip the rolling continuation tail ref. Needs the audio_vae input - without it the soundtrack is skipped with a warning."),
+                        prefix="ref_video_audio_", min=0, max=3)),
             ],
             outputs=[io.Conditioning.Output(display_name="conditioning")],
         )
@@ -1257,17 +1434,28 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
     def execute(cls, conditioning, clip, vae=None, audio_vae=None,
                 ref_image_size="match", width=1344, height=768,
                 audio_seconds_per_scene=10.0,
-                ref_images=None, ref_audios=None):
+                ref_images=None, ref_audios=None, ref_videos=None,
+                ref_video_audios=None):
         ref_images = {k: v for k, v in (ref_images or {}).items()
                       if v is not None}
         ref_audios = {k: v for k, v in (ref_audios or {}).items()
                       if v is not None}
-        if not ref_images and not ref_audios:
-            raise ValueError("connect at least one reference image and/or audio")
+        ref_videos = {k: v for k, v in (ref_videos or {}).items()
+                      if v is not None}
+        ref_video_audios = {k: v for k, v in (ref_video_audios or {}).items()
+                            if v is not None}
+        if not ref_images and not ref_audios and not ref_videos:
+            raise ValueError("connect at least one reference image, video "
+                             "and/or audio")
         if ref_images and vae is None:
             raise ValueError("encoding reference images needs the vae input")
+        if ref_videos and vae is None:
+            raise ValueError("encoding reference videos needs the vae input")
         if ref_audios and audio_vae is None:
             raise ValueError("encoding reference audios needs the audio_vae input")
+        if ref_video_audios and audio_vae is None:
+            print("[CLSS] WARNING: ref_video_audio inputs are wired without "
+                  "the audio_vae — their soundtracks are skipped.")
         n_scenes = len(conditioning)
         if n_scenes < 1:
             raise ValueError("the conditioning holds no scenes — feed it from "
@@ -1278,6 +1466,20 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
                            key=lambda n: int(n.rsplit("_", 1)[-1])):
             img_pairs.append(_encode_ref_image_pair(
                 vae, ref_images[name], ref_image_size, width, height))
+
+        vid_entries = []
+        for name in sorted(ref_videos,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            _idx = name.rsplit("_", 1)[-1]
+            vid_entries.append(_resolve_ref_video(
+                vae, ref_videos[name],
+                ref_video_audios.get("ref_video_audio_" + _idx), audio_vae))
+        for name in sorted(ref_video_audios,
+                           key=lambda n: int(n.rsplit("_", 1)[-1])):
+            _vid = "ref_video_" + name.rsplit("_", 1)[-1]
+            if _vid not in ref_videos:
+                print(f"[CLSS] WARNING: {name} has no matching {_vid} — "
+                      f"ignored.")
 
         aud_pairs: list[list] = [[] for _ in range(n_scenes)]
         _win_blocks: list[dict | None] = [None] * n_scenes
@@ -1324,8 +1526,9 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
                          f"guard) from {_total / vae_sr:.1f}s of audio")
         else:
             _aud_desc = "none"
-        print(f"[CLSS] all-scenes refs: {len(img_pairs)} image(s) -> ALL "
-              f"{n_scenes} scene(s) | audio: {_aud_desc}")
+        print(f"[CLSS] all-scenes refs: {len(img_pairs)} image(s)"
+              + (f" + {len(vid_entries)} video(s)" if vid_entries else "")
+              + f" -> ALL {n_scenes} scene(s) | audio: {_aud_desc}")
         if ref_audios:
             if _covered == n_scenes and _used < _total:
                 print(f"[CLSS] all-scenes refs: {(_total - _used) / vae_sr:.1f}s "
@@ -1338,12 +1541,16 @@ class CLSSH3SceneReferencesAll(io.ComfyNode):
 
         out = conditioning
         for i in range(n_scenes):
-            pairs = img_pairs + aud_pairs[i]
-            if not pairs:
+            entries = ([{"items": [it], "block": blk}
+                        for it, blk in img_pairs]
+                       + list(vid_entries)
+                       + [{"items": [it], "block": blk}
+                          for it, blk in aud_pairs[i]])
+            if not entries:
                 print(f"[CLSS] all-scenes refs: scene {i + 1} has no refs — "
                       f"left as plain text conditioning.")
                 continue
-            out = _attach_scene_refs(clip, out, i + 1, pairs)
+            out = _attach_scene_refs(clip, out, i + 1, entries)
         if _track is not None:
             _stash = {"waveform": _track, "sample_rate": vae_sr,
                       "windows": _win_blocks}
@@ -2191,8 +2398,11 @@ class CLSSH3StreamingSampler:
             _rl = _pc.get("minimax_refs") or []
             if _rl:
                 _ni = sum(1 for _r in _rl if _r.get("kind") == "image")
+                _nv = sum(1 for _r in _rl
+                          if _r.get("kind") in ("video", "video_audio"))
                 _arts = [_r for _r in _rl if _r.get("kind") == "audio"]
-                _ref_desc.append(f"scene{_si + 1}={_ni}i+{len(_arts)}a")
+                _ref_desc.append(f"scene{_si + 1}={_ni}i+{len(_arts)}a"
+                                 + (f"+{_nv}v" if _nv else ""))
                 if len(_arts) == 1 and _scene_span_af[_si] > 0:
                     _aw = int(_arts[0].get("ref_audio_t") or 0)
                     _want = round(_scene_span_af[_si] + _scene_lead_af[_si])
@@ -2391,11 +2601,16 @@ class CLSSH3StreamingSampler:
             _prev_scene_idx = scene_idx
             _chunk_refs = pos_conds[scene_idx].get("minimax_refs") or []
             _scene_aud_n = sum(1 for _r in _chunk_refs
-                               if _r.get("kind") == "audio")
+                               if _r.get("kind") == "audio"
+                               or (_r.get("kind") == "video_audio"
+                                   and int(_r.get("ref_audio_t") or 0) > 0))
             if _chunk_refs:
                 _ni = sum(1 for _r in _chunk_refs if _r.get("kind") == "image")
+                _nv = sum(1 for _r in _chunk_refs
+                          if _r.get("kind") in ("video", "video_audio"))
                 _na = _scene_aud_n
-                _cfg_r = f" refs={_ni}i+{_na}a"
+                _cfg_r = (f" refs={_ni}i+{_na}a"
+                          + (f"+{_nv}v" if _nv else ""))
 
             keyframes: list[dict] = []
             if is_first and img_guide_latent is not None:
