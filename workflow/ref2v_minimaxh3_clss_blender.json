@@ -1,0 +1,479 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot_v2.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Video VAE (H3)"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Audio VAE (H3)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_hybrid_b20-49_pruned_w4a8_mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3-vl-8b-heretic-1.3.0-int8convrot.safetensors",
+      "type": "auto",
+      "projection": "mmh3-8b-ClipProj-v3.1-mlp.safetensors",
+      "device": "cuda:0",
+      "mode": "resident"
+    },
+    "class_type": "ClipProjLoader",
+    "_meta": {
+      "title": "ClipProj: 4B encoder + projection (replaces 15.7 GB 32B)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "prompts": "subject_definitions\n<Subject 1> is Mira Voss, the time-runner: a 28-year-old woman of mixed ethnicity with warm brown skin, sharp features, and a lean athletic build. She has short black undercut hair with a single silver streak on the left side, amber-gold eyes, and a small scar through her left eyebrow. She wears a fitted charcoal time-runner jacket with teal circuit seams, matte black compression sleeves, fingerless black gloves, dark tactical running pants, and sleek black-and-amber running shoes. A circular chrono-device with a glowing cyan ring sits on her left forearm. A thin silver chain with a small glass bead hangs at her neck.\n\n<Picture 1> is Mira Voss, short black undercut hair with a silver streak, amber-gold eyes, charcoal jacket with teal seams, black compression sleeves, fingerless gloves, dark tactical pants, black-and-amber shoes, circular cyan chrono-device on the left forearm.\n\n<Picture 2> is a storyboard reference for [Shot 1]: a wide shot of <Subject 1> running along a raised stone channel above a structure, low grey sky, blocky rooftops in the middle distance.\n\n<Picture 3> is a storyboard reference for [Shot 1]'s side profile: <Subject 1> mid-stride, the aqueduct edge crossing the frame, rooftops behind.\n\n<Picture 4> is a storyboard reference for [Shot 2]: a low angle of <Subject 1> near the aqueduct edge, a tall vertical rift of light with scattered round sparks on the right side of the frame.\n\n<Picture 5> is a storyboard reference for [Shot 2]'s end: <Subject 1> close to the aqueduct edge, the tall vertical rift rising beside her.\n\nsummary\n[reference generation] This 10-second chunk shows <Subject 1> sprinting across a bronze-age aqueduct at golden hour, observing bronze casting below, and leaping through a cyan time-rift. <Picture 2> through <Picture 5> provide storyboard and spatial planning only.\n\nretention_analysis\n<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved — Mira's identity, silver-streaked black undercut, amber-gold eyes, charcoal jacket, cyan chrono-device, and black-and-amber shoes are retained.\n<Picture 1> (appearance anchor): fully_preserved — the character design anchors <Subject 1>'s appearance.\n<Picture 2> (storyboard/planning guide): weak_reference — only the spatial layout and shot framing guide [Shot 1].\n<Picture 3> (storyboard/planning guide): weak_reference — only the side-profile composition and aqueduct placement guide [Shot 1].\n<Picture 4> (storyboard/planning guide): weak_reference — only the low angle, rift placement, and spark scatter guide [Shot 2].\n<Picture 5> (storyboard/planning guide): weak_reference — only the final composition near the rift guides [Shot 2].\n\ndetailed_description\nThe target video is a photorealistic, cinematic sci-fi chase through time, with a slightly desaturated palette, cool cyan highlights, warm golden-hour accents, shallow depth of field, and anamorphic lens flare. The reference images serve only as spatial and action guides; the final look is fully cinematic and realistic. This chunk is self-contained; its first and last 1.9 seconds hold a stable silhouette for SLB overlap.\n\n[Shot 1] At 00:00.000, the scene opens in a bronze-age city at golden hour. <Subject 1>, Mira Voss from <Picture 1>, runs along a raised stone aqueduct edge in a wide tracking shot: mixed-ethnicity woman, warm brown skin, short black undercut with a silver streak on the left, amber-gold eyes, small scar through the left eyebrow, charcoal time-runner jacket with teal circuit seams, matte black compression sleeves, fingerless gloves, dark tactical pants, black-and-amber running shoes, circular cyan chrono-device on the left forearm. Her jacket is lightly dusted with ash. Below and beyond, blocky bronze-age rooftops spread toward a low horizon. Artisans pour molten bronze into molds while a wheeled cart rolls past. She glances down with quiet fascination, her breath controlled. At 00:03.000, the shot cuts to a tighter side profile as she passes the aqueduct edge, rooftops behind her.\n\n[Shot 2] At 00:05.000, the shot cuts to a low angle from beneath the aqueduct. Ahead of her, a tall vertical cyan-white rift with floating round amber sparks tears open at the aqueduct edge. She accelerates, jumps with arms wide, and the city dissolves into cyan light. Market chatter, bronze hammering, and a low synthetic pulse. No dialogue.\n\noverall_soundscape\nBronze hammering, market chatter, and a low synthetic pulse continue throughout the chunk.\n\nnon_diegetic_music\nA cinematic hybrid orchestral-electronic score with pulsing low strings and rising synth arpeggios that build as the rift opens.",
+      "global_text": "",
+      "audio_continuity_text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (--- separated)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "prompts": "blurry, low quality, still frame, watermark, overlay, titles, subtitles, harsh electronic hiss, heavy distorted SFX",
+      "global_text": "",
+      "audio_continuity_text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CLSSH3ScenePrompts",
+    "_meta": {
+      "title": "CLSS H3 Scene Prompts (negative)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "width": [
+        "43",
+        0
+      ],
+      "height": [
+        "44",
+        0
+      ],
+      "length": 243
+    },
+    "class_type": "EmptyMiniMaxH3LatentAV",
+    "_meta": {
+      "title": "Empty H3 AV Latent (per-chunk: 243 px ≈ 10.1 s)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSampler Select"
+    }
+  },
+  "9": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "39",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise_seed": 13142343569
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "12": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "rescale": 0.7,
+      "model": [
+        "39",
+        0
+      ],
+      "positive": [
+        "62",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "CLSS H3 Guider (Split AV CFG)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "filename_prefix": "clss_h3/CLSSH3_frame_",
+      "frames_per_slice": 27,
+      "context_frames": 0,
+      "fps": 24,
+      "vae": [
+        "1",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "CLSSH3VideoDecodeSave",
+    "_meta": {
+      "title": "CLSS H3 Video Decode+Save (streaming)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "filename_prefix": "audio/CLSSH3",
+      "format": "flac",
+      "audio": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save Audio"
+    }
+  },
+  "16": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "MiniMaxH3 Sigma Shift"
+    }
+  },
+  "23": {
+    "inputs": {
+      "tau_c": 0.05,
+      "beta": 0.4,
+      "overlap": 7,
+      "ema_mean_max": 0.25,
+      "overlap_evict_after": 0,
+      "step_cache_thresh": 0.06
+    },
+    "class_type": "CLSSH3Config",
+    "_meta": {
+      "title": "CLSS H3 Config"
+    }
+  },
+  "36": {
+    "inputs": {
+      "image": "hero.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Diffusion generated character spreadsheet"
+    }
+  },
+  "39": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength": 1,
+      "low_vram": false,
+      "model": [
+        "65",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo LoRA"
+    }
+  },
+  "43": {
+    "inputs": {
+      "value": [
+        "82",
+        0
+      ]
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "width"
+    }
+  },
+  "44": {
+    "inputs": {
+      "value": [
+        "82",
+        1
+      ]
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Height"
+    }
+  },
+  "62": {
+    "inputs": {
+      "ref_image_size": "match",
+      "audio_seconds_per_scene": 10,
+      "width": [
+        "43",
+        0
+      ],
+      "height": [
+        "44",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "36",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "117",
+        0
+      ],
+      "ref_images.ref_image_2": [
+        "119",
+        0
+      ],
+      "ref_images.ref_image_3": [
+        "123",
+        0
+      ],
+      "ref_images.ref_image_4": [
+        "124",
+        0
+      ],
+      "ref_images.ref_image_5": [
+        "125",
+        0
+      ]
+    },
+    "class_type": "CLSSH3SceneReferencesAll",
+    "_meta": {
+      "title": "CLSS H3 Scene References (R2V all scenes)"
+    }
+  },
+  "65": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "Model Attention Backend"
+    }
+  },
+  "82": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.5,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "Resolution Selector (Size)"
+    }
+  },
+  "117": {
+    "inputs": {
+      "image": "t00_shot1_open (4).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Blender generated"
+    }
+  },
+  "119": {
+    "inputs": {
+      "image": "t02_shot1_mid (4).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Blender generated"
+    }
+  },
+  "121": {
+    "inputs": {
+      "num_chunks": 1,
+      "upscale_scale": 1.5,
+      "fps": 24,
+      "detail_anchor": "on",
+      "audio_xfade_ms": 0,
+      "audio_join_lead_ms": 0,
+      "scene_handoff": "hard",
+      "tail_margin_px": 12,
+      "guider": [
+        "12",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "noise": [
+        "10",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ],
+      "clss_config": [
+        "23",
+        0
+      ],
+      "audio_config": [
+        "122",
+        0
+      ],
+      "audio_vae": [
+        "2",
+        0
+      ],
+      "audio_refine_guider": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "CLSSH3StreamingSampler",
+    "_meta": {
+      "title": "CLSS H3 Streaming Sampler"
+    }
+  },
+  "122": {
+    "inputs": {
+      "audio_recompose_steps": 0,
+      "audio_recompose_sigma": 1,
+      "audio_arc_margin_ms": 0,
+      "audio_recompose_pool": 2,
+      "audio_recompose_stride": 2,
+      "audio_recompose_seed": 131312313,
+      "audio_recompose_ref_ms": 8000,
+      "audio_head_discard_ms": 0,
+      "loop_guard_rerolls": 2,
+      "loop_guard_wc": 0.99,
+      "loop_guard_loop": 0.7,
+      "loop_guard_retry_ref_ms": 2000,
+      "loop_guard_draft_frac": 0.4
+    },
+    "class_type": "CLSSH3AudioConfig",
+    "_meta": {
+      "title": "CLSS H3 Audio Config"
+    }
+  },
+  "123": {
+    "inputs": {
+      "image": "t05_shot2_open (4).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Blender generated"
+    }
+  },
+  "124": {
+    "inputs": {
+      "image": "t07_shot2_rift (4).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Blender generated"
+    }
+  },
+  "125": {
+    "inputs": {
+      "image": "t09_shot2_end (4).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Blender generated"
+    }
+  },
+  "126": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 4,
+      "rescale": 0.7,
+      "model": [
+        "65",
+        0
+      ],
+      "positive": [
+        "62",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CLSSH3Guider",
+    "_meta": {
+      "title": "CLSS H3 Guider (Split AV CFG)"
+    }
+  }
+}
