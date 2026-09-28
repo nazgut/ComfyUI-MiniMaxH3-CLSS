@@ -652,7 +652,7 @@ class CLSSH3Config:
                                       "tooltip": "EXPERIMENTAL - two-phase overlap eviction (KV-cache analog): continuation chunks run this fraction of steps on the full window so the overlap rows absorb their context, then drop all but the last 2 overlap rows (frozen at the intermediate x0) and continue on the shrunken window, re-noised from that x0 with identical noise and true positional times via a PackedLayout position fixup (requires the Motion Context layout patch; auto-disabled without it). At the default 7-token overlap and 0.4, the last 60% of steps run with 5 fewer video rows. 0 = off. Skipped on first chunks, head-pin chunks and scene switches; the audio side is untouched.",
                                       }),
                 "step_cache_thresh": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.3, "step": 0.01,
-                                      "tooltip": "EXPERIMENTAL step caching (TeaCache-style): when the sampler input has moved less than this relative L1 since the last computed step, the whole DiT forward is skipped and the previous prediction is reused. At 6-8 steps a value around 0.06 typically skips 1-3 steps per chunk (~20-45% faster); 0.10+ gets visibly softer. Never skips the first step, the low-sigma tail (last 20% of the schedule), or two steps in a row, and each chunk/recompose pass re-arms automatically. 0 = off.",
+                                      "tooltip": "EXPERIMENTAL step caching: when the sampler input has moved less than this relative L1 since the last computed step, the whole DiT forward is skipped and a Taylor-extrapolated prediction (first-order drift from the last two computed steps, NOT stale reuse) is returned. Per-tile veto: if the worst 10% of latent tiles moved more than 2.5x the threshold, the skip is cancelled, so a calm background cannot drag a moving subject through a skipped step. Never skips the first two steps of a pass (derivative warmup), the low-sigma tail, or two steps in a row; each chunk/recompose pass re-arms automatically. Watch the per-step [CLSS] step cache telemetry to tune: set the threshold just above the mid-step rel values. 0 = off.",
                                       }),
             },
         }
@@ -1616,6 +1616,30 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
                 tuple(u.to(device) for u in t.tensors))
         return t.to(device)
 
+    @staticmethod
+    def _sc_taylor(out1, s1, out2, s2, s_now):
+        # first-order (TaylorSeer-style) extrapolation of the prediction
+        # along the sigma axis, instead of reusing the stale prediction:
+        # the skipped step keeps moving in the direction the prediction was
+        # already drifting. c is clamped so a widening sigma gap (late
+        # schedule steps are spaced wider) can't rocket the output.
+        c = (s1 - s_now) / max(s2 - s1, 1e-9)
+        c = min(max(c, 0.0), 1.5)
+
+        def _comb(a, b):
+            # clone first: .float() is a no-op alias for fp32 tensors and
+            # the parked cache entry must never be mutated in place
+            d = a.clone().float()
+            d -= b.float()
+            d *= c
+            d += a.float()
+            return d.to(a.dtype)
+
+        if isinstance(out1, comfy.nested_tensor.NestedTensor):
+            return c, comfy.nested_tensor.NestedTensor(
+                tuple(_comb(a, b) for a, b in zip(out1.tensors, out2.tensors)))
+        return c, _comb(out1, out2)
+
     def predict_noise(self, x, timestep, model_options={}, seed=None):
         thr = float(getattr(self, "_step_cache_thresh", 0.0))
         if thr <= 0.0:
@@ -1642,34 +1666,51 @@ class _GuiderCLSSH3(comfy.samplers.CFGGuider):
                 print(f"[CLSS] step cache: skipped {st['skips']}/{_tot} "
                       f"model evals ({100.0 * st['skips'] / _tot:.0f}%)")
             st.clear()
-            st.update(sigma=None, fp=None, out=None, skips=0, computes=0,
+            st.update(sigma=None, fp=None, out=None, out2=None,
+                      s1=None, sigma2=None, skips=0, computes=0,
                       last_skipped=True, sigma_start=sigma,
                       shape=tuple(fp.shape))
         if st["fp"] is not None:
-            rel = float((fp - st["fp"]).abs().mean()
-                        / st["fp"].abs().mean().clamp(min=1e-8))
+            # per-token (per-tile) movement: the mean decides the skip, but
+            # the worst 10% of tiles can veto it - a calm background must not
+            # drag a moving subject through a skipped step
+            rel_t = ((fp - st["fp"]).abs()
+                     / st["fp"].abs().mean().clamp(min=1e-8))
+            rel = float(rel_t.mean())
+            rel_p90 = float(rel_t.flatten().quantile(0.9))
             why = None
             if rel >= thr:
                 why = f"rel {rel:.4f} >= thresh {thr}"
+            elif rel_p90 >= 2.5 * thr:
+                why = (f"hot tiles veto (p90 rel {rel_p90:.4f} >= "
+                       f"{2.5 * thr:.3f})")
             elif st["last_skipped"]:
                 why = "previous step was a skip"
             elif sigma <= 0.2 * st["sigma_start"]:
                 why = "low-sigma tail step"
+            elif st["out2"] is None:
+                why = "warming up (2 computed steps needed for extrapolation)"
             if why is None:
+                c, out_t = self._sc_taylor(st["out"], st["s1"],
+                                           st["out2"], st["sigma2"], sigma)
                 st["skips"] += 1
                 st["last_skipped"] = True
                 st["sigma"] = sigma
                 print(f"[CLSS] step cache: sigma={sigma:.4f} "
-                      f"rel={rel:.4f} < {thr} -> SKIP (reusing previous "
-                      f"prediction)")
-                return self._sc_unpark(st["out"], xx.device)
+                      f"rel={rel:.4f} p90={rel_p90:.4f} -> SKIP "
+                      f"(Taylor-extrapolated prediction, c={c:.2f})")
+                return self._sc_unpark(out_t, xx.device)
             print(f"[CLSS] step cache: sigma={sigma:.4f} rel={rel:.4f} "
-                  f"-> compute ({why})")
+                  f"p90={rel_p90:.4f} -> compute ({why})")
         else:
             print(f"[CLSS] step cache: sigma={sigma:.4f} -> compute "
                   f"(pass start, cache empty)")
         out = self._predict_noise_impl(x, timestep, model_options, seed)
-        st.update(fp=fp, out=self._sc_park(out), sigma=sigma,
+        # shift the derivative pair BEFORE overwriting: out2/sigma2 are the
+        # previous COMPUTED step (st["sigma"] may hold a skipped sigma, so
+        # the derivative pairs with s1, which only moves on computes)
+        st["out2"], st["sigma2"] = st.get("out"), st.get("s1")
+        st.update(fp=fp, out=self._sc_park(out), sigma=sigma, s1=sigma,
                   last_skipped=False)
         st["computes"] += 1
         return out
@@ -1803,6 +1844,359 @@ class CLSSH3AttentionOverride:
               f"heartbeat once sampling starts)")
         return (patcher,)
 
+
+# ---------------------------------------------------------------------------
+# CLSS Spectrum hidden-state forecasting.
+#
+# Technique from "Adaptive Spectral Feature Forecasting for Diffusion
+# Sampling Acceleration" (Han et al., arXiv 2603.01623), adapted for the
+# CLSS streaming loop (mechanics cross-checked against the ComfyUI Spectrum
+# port for MiniMax H3):
+#   * ACTUAL steps run the model normally and capture the target-stream
+#     hidden state right after the LAST DiT block (CPU-parked anchor);
+#   * FORECAST steps bypass ALL DiT blocks with identity patches_replace
+#     hooks and inject a Chebyshev/linear extrapolation of the anchors
+#     straight into the hidden stream before the native FinalLayer - so the
+#     output head still runs with the EXACT current-sigma adaln modulation,
+#     PDD heads, denoise-mask rows and unpatchify. Only the transformer
+#     stack (~99% of step cost) is skipped. Because the per-step modulation
+#     stays exact, this holds quality far better than output-level caching.
+#
+# Policy (per sampling pass; a pass = one sigma schedule, detected via a
+# sigma jump-up or a latent shape change, e.g. overlap eviction):
+# the first `warmup_steps` calls and the last `tail_actual_steps` calls are
+# always actual, the steps in between forecast from captured anchors.
+# Defaults warmup=2 / tail=1 turn a 6-step turbo chunk into A A F F F A -
+# ~50% of the DiT evals skipped on every chunk.
+# ---------------------------------------------------------------------------
+
+_SPEC_SC_NOTE = [False]
+
+
+def _spec_cheb_design(coords, degree):
+    x = torch.tensor([float(c) for c in coords], dtype=torch.float32)
+    cols = [torch.ones_like(x)]
+    if degree >= 1:
+        cols.append(x.clone())
+    for _ in range(2, int(degree) + 1):
+        cols.append(2.0 * x * cols[-1] - cols[-2])
+    return torch.stack(cols[: int(degree) + 1], dim=1)
+
+
+def _spec_weights(coords, target, degree, ridge_lambda, blend):
+    """Forecast weights over anchors at `coords` for `target` (all
+    normalised to [-1, 1]): ridge-regularised Chebyshev extrapolation
+    blended with plain 2-point linear extrapolation (blend 0 = linear
+    only, blend 1 = Chebyshev only)."""
+    k = len(coords)
+    lin = torch.zeros(k, dtype=torch.float32)
+    if k == 1:
+        lin[0] = 1.0
+    else:
+        spacing = float(coords[-1]) - float(coords[-2])
+        if abs(spacing) <= 1e-12:
+            lin[-1] = 1.0
+        else:
+            r = (float(target) - float(coords[-1])) / spacing
+            lin[-2] = -r
+            lin[-1] = 1.0 + r
+    if float(blend) <= 1e-12 or k < 2:
+        return lin
+    deg = max(1, min(int(degree), k - 1))
+    design = _spec_cheb_design(coords, deg)
+    gram = design.T @ design
+    gram += float(ridge_lambda) * torch.eye(deg + 1)
+    try:
+        sol = torch.linalg.solve(gram, design.T)            # (deg+1, k)
+    except Exception:
+        return lin
+    spec = (_spec_cheb_design([target], deg) @ sol).reshape(-1)
+    return float(blend) * spec + (1.0 - float(blend)) * lin
+
+
+def _spec_combine(anchors, weights):
+    """fp32 CPU weighted sum of the (bf16) anchor tensors."""
+    out = None
+    for w, a in zip(weights, anchors):
+        w = float(w)
+        if abs(w) <= 1e-12:
+            continue
+        term = a.float() * w
+        out = term if out is None else out.add_(term)
+    if out is None:
+        raise RuntimeError("empty forecast weights")
+    return out
+
+
+def _spec_target_bounds(layout):
+    """(start, stop) of the packed target tail (audio + video rows) - the
+    same segment selector the native H3 forward uses."""
+    va, vb, _ = next(s for s in layout.segments if s[2] == "video")
+    aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
+    if ab != va:
+        raise RuntimeError("target streams are not contiguous")
+    return aa, vb
+
+
+def _spec_identity_block(args, replacement_context):
+    return args
+
+
+class _SpectrumH3State:
+    def __init__(self, warmup_steps, tail_actual_steps, degree, blend,
+                 ridge_lambda, max_history, pattern="alternate"):
+        self.warmup = max(1, int(warmup_steps))
+        self.tail = max(0, int(tail_actual_steps))
+        self.degree = max(1, min(3, int(degree)))
+        self.blend = float(blend)
+        self.ridge = float(ridge_lambda)
+        self.max_history = max(2, int(max_history))
+        self.pattern = (pattern if pattern in ("alternate", "consecutive")
+                        else "alternate")
+        self.dead = False            # hard conflict -> plain model forever
+        self.printed_anchor = False
+        self.reset_pass()
+
+    def reset_pass(self):
+        self.hist = {}               # branch -> list[[coord, cpu tensor]]
+        self.calls = {}              # branch -> call index within pass
+        self.prev_t = None
+        self.t0 = None
+        self.x_shapes = None
+        self.n_calls = 0
+        self.n_fore = 0
+        self.n_act = 0
+        self.n_blocks = 0
+
+
+def _make_spectrum_h3_wrapper(st):
+
+    def _wrapper(executor, x, timestep, context, transformer_options=None,
+                 **kwargs):
+        options = transformer_options or {}
+        inner = getattr(executor, "class_obj", None)
+        blocks = getattr(inner, "blocks", None)
+        if (st.dead or blocks is None or len(blocks) == 0
+                or not isinstance(x, (list, tuple)) or len(x) != 2):
+            return executor(x, timestep, context, options, **kwargs)
+        try:
+            t = float(timestep.flatten()[0])
+        except Exception:
+            return executor(x, timestep, context, options, **kwargs)
+        n_blocks = len(blocks)
+        st.n_blocks = n_blocks
+
+        # --- pass detection: schedule restart or latent shape change ------
+        shapes = (tuple(x[0].shape), tuple(x[1].shape))
+        if (st.prev_t is None or t > st.prev_t + 1e-3
+                or st.x_shapes != shapes):
+            if st.n_calls:
+                print(f"[CLSS] spectrum: pass done - forecasted "
+                      f"{st.n_fore}/{st.n_calls} DiT evals")
+            st.reset_pass()
+            st.n_blocks = n_blocks
+            st.t0 = t
+        st.prev_t = t
+        st.x_shapes = shapes
+        st.n_calls += 1
+
+        branch = tuple(options.get("cond_or_uncond", ()) or ())
+        idx = st.calls.get(branch, 0)
+        st.calls[branch] = idx + 1
+        coord = max(-1.0, min(1.0, 2.0 * (t / max(st.t0, 1e-8)) - 1.0))
+
+        sigmas = options.get("sample_sigmas")
+        try:
+            n_steps = (max(0, len(sigmas) - 1)
+                       if sigmas is not None else None)
+        except TypeError:
+            n_steps = None
+        in_tail = ((idx >= n_steps - st.tail) if n_steps
+                   else (st.tail > 0 and t <= 0.2 * st.t0))
+
+        hist = st.hist.setdefault(branch, [])
+        pr_in = options.get("patches_replace") or {}
+        dit_in = pr_in.get("dit") or {}
+        other_owner = any(k[0] == "double_block" for k in dit_in)
+
+        # Forecast slot geometry. "alternate" interleaves actual steps so
+        # the anchors spread across the schedule and every forecast is a
+        # short extrapolation from well-spaced anchors (the turbo schedule
+        # packs sigmas densely at the top, so consecutive forecasting would
+        # extrapolate many step-widths out of two very close anchors).
+        # "consecutive" is the classic Spectrum policy: everything between
+        # warmup and tail forecasts from the warmup anchors.
+        if st.pattern == "alternate":
+            slot = (idx >= st.warmup and (idx - st.warmup) % 2 == 0)
+            min_anchors = 1
+        else:
+            slot = idx >= st.warmup
+            min_anchors = 2
+
+        # --- forecast step: bypass every DiT block, inject prediction -----
+        if not in_tail and slot and len(hist) >= min_anchors:
+            if other_owner:
+                st.dead = True
+                print("[CLSS] WARNING: spectrum found another plugin's DiT "
+                      "block replacements - forecasting disabled for this "
+                      "model (fail-closed, quality first).")
+            else:
+                try:
+                    w = _spec_weights([c for c, _ in hist], coord,
+                                      st.degree, st.ridge, st.blend)
+                    if (not bool(torch.isfinite(w).all())
+                            or float(w.abs().sum()) > 8.0):
+                        raise RuntimeError("forecast weights went wild")
+                    fc = _spec_combine([a for _, a in hist], w)
+                except Exception as exc:
+                    print(f"[CLSS] WARNING: spectrum forecast skipped "
+                          f"({exc!r}) - running this step for real.")
+                else:
+                    def _inject(args, _ctx, _fc=fc):
+                        h = args["img"]
+                        aa, vb = _spec_target_bounds(args.get("layout"))
+                        pred = _fc.to(device=h.device, dtype=h.dtype)
+                        if (pred.shape[0] != vb - aa
+                                or pred.shape[-1] != h.shape[-1]):
+                            raise RuntimeError(
+                                f"anchor shape {tuple(pred.shape)} != "
+                                f"target rows ({vb - aa}, {h.shape[-1]})")
+                        h[aa:vb] = pred
+                        return args
+
+                    local = dict(options)
+                    dit = dict(dit_in)
+                    for i in range(n_blocks - 1):
+                        dit[("double_block", i)] = _spec_identity_block
+                    dit[("double_block", n_blocks - 1)] = _inject
+                    pr = dict(pr_in)
+                    pr["dit"] = dit
+                    local["patches_replace"] = pr
+                    try:
+                        out = executor(x, timestep, context, local,
+                                       **kwargs)
+                    except Exception as exc:
+                        print(f"[CLSS] WARNING: spectrum forecast step "
+                              f"failed ({exc!r}) - re-running for real.")
+                    else:
+                        st.n_fore += 1
+                        print(f"[CLSS] spectrum: FORECAST step {idx + 1}"
+                              f"{f'/{n_steps}' if n_steps else ''} "
+                              f"({len(hist)} anchors) - all {n_blocks} "
+                              f"DiT blocks bypassed")
+                        return out
+
+        # --- actual step: run for real, capture final-block hidden --------
+        box = {}
+        existing_last = dit_in.get(("double_block", n_blocks - 1))
+
+        def _capture(args, ctx, _existing=existing_last, _box=box):
+            out = (_existing(args, ctx) if _existing is not None
+                   else ctx["original_block"](args))
+            try:
+                aa, vb = _spec_target_bounds(args.get("layout"))
+                _box["view"] = out["img"][aa:vb].detach()
+            except Exception as exc:
+                _box["err"] = exc
+            return out
+
+        local = dict(options)
+        dit = dict(dit_in)
+        dit[("double_block", n_blocks - 1)] = _capture
+        pr = dict(pr_in)
+        pr["dit"] = dit
+        local["patches_replace"] = pr
+        out = executor(x, timestep, context, local, **kwargs)
+        view = box.get("view")
+        if view is not None:
+            hist.append([coord, view.to("cpu", copy=True)])
+            del hist[:-st.max_history]
+            st.n_act += 1
+            if not st.printed_anchor:
+                st.printed_anchor = True
+                print(f"[CLSS] spectrum: anchors {tuple(view.shape)} "
+                      f"{view.dtype} (~{view.numel() * view.element_size() / 2**20:.0f}MB) "
+                      f"parked on CPU, up to {st.max_history} per branch")
+        elif "err" in box and not getattr(st, "_cap_warned", False):
+            st._cap_warned = True
+            print(f"[CLSS] WARNING: spectrum anchor capture failed "
+                  f"({box['err']!r}) - forecasting disabled, model still "
+                  f"runs normally.")
+        return out
+
+    return _wrapper
+
+
+def _spec_sc_thresh_for(guider, clss_config):
+    """Step-cache threshold with Spectrum arbitration: when a Spectrum
+    forecast wrapper is armed on the model the output-level step cache is
+    disabled (both skip DiT evals; Spectrum keeps the per-step FinalLayer
+    modulation exact, so it wins on quality)."""
+    thr = float(getattr(clss_config, "step_cache_thresh", 0.0))
+    if thr <= 0.0:
+        return 0.0
+    mo = getattr(getattr(guider, "model_patcher", None), "model_options",
+                 None) or {}
+    if "clss_spectrum_h3" not in mo:
+        return thr
+    if not _SPEC_SC_NOTE[0]:
+        _SPEC_SC_NOTE[0] = True
+        print("[CLSS] Spectrum forecasting armed on this model - "
+              "step_cache is disabled for it (both skip the DiT forward; "
+              "Spectrum keeps the per-step FinalLayer modulation exact).")
+    return 0.0
+
+
+class CLSSH3SpectrumForecast:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "MODEL (MiniMax H3) to accelerate with Spectrum hidden-state forecasting. Wire it between the loader and the CLSS guider (after the attention override, if used)."}),
+                "pattern": (["alternate", "consecutive"], {"default": "alternate", "tooltip": "Which steps of each schedule forecast. alternate = after warmup every second step is real (A A F A F A on a 6-step chunk) - anchors spread over the whole schedule, so each forecast is a short, well-conditioned extrapolation. consecutive = the classic Spectrum policy, everything between warmup and tail forecasts (A A F F F A) - more skipped steps but the late forecasts extrapolate far out of two very close top-sigma anchors, which is exactly where quality would crack on the 6-step turbo schedule."}),
+                "warmup_steps": ("INT", {"default": 2, "min": 1, "max": 10, "tooltip": "First N model calls of every sampling pass always run for real and build the anchor history. 2 = the safest start (first forecast already sees two anchors). 1 lets the second step forecast from a single anchor (a hold - cheapest, slightly stale)."}),
+                "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 5, "tooltip": "Last N steps of every schedule always run for real - the low-sigma tail carries the fine detail. With pattern=alternate the forecasts are short extrapolations, so 0 is usually safe to try: combined with warmup_steps=1 a 6-step chunk becomes A F A F A F (3 of 6 DiT evals skipped). Keep 1 if you see detail loss."}),
+                "degree": ("INT", {"default": 1, "min": 1, "max": 3, "tooltip": "Chebyshev polynomial degree of the spectral forecaster (clamped to anchors-1). 1 = linear-in-feature-space, the value the Spectrum runs validate. Higher degrees need more anchors and can overfit on short turbo schedules."}),
+                "blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Blend between the Chebyshev ridge forecast (1.0) and plain 2-point linear extrapolation of the hidden state (0.0). 0.5 is the validated Spectrum default."}),
+                "ridge_lambda": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Ridge regularisation of the Chebyshev fit; larger = tamer extrapolation. 0.1 is the Spectrum default."}),
+                "max_history": ("INT", {"default": 4, "min": 2, "max": 8, "tooltip": "Anchors kept per pass/branch (CPU-parked hidden states, ~100-300MB each depending on canvas). 4 is plenty for degree 1-2 on 6-step schedules."}),
+            },
+        }
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "MiniMaxH3-CLSS"
+
+    def patch(self, model, pattern, warmup_steps, tail_actual_steps, degree,
+              blend, ridge_lambda, max_history):
+        try:
+            import comfy.patcher_extension as _pe
+        except ImportError:
+            print("[CLSS] WARNING: this ComfyUI build has no "
+                  "comfy.patcher_extension - Spectrum forecasting needs the "
+                  "DIFFUSION_MODEL wrapper hook; model returned unchanged.")
+            return (model,)
+        patcher = model.clone()
+        key = "clss_spectrum_h3"
+        try:
+            if patcher.get_wrappers(_pe.WrappersMP.DIFFUSION_MODEL, key):
+                return (patcher,)
+            st = _SpectrumH3State(warmup_steps, tail_actual_steps, degree,
+                                  blend, ridge_lambda, max_history, pattern)
+            patcher.add_wrapper_with_key(_pe.WrappersMP.DIFFUSION_MODEL,
+                                         key, _make_spectrum_h3_wrapper(st))
+        except Exception as exc:
+            print(f"[CLSS] WARNING: could not arm Spectrum forecasting "
+                  f"({exc!r}); model returned unchanged.")
+            return (model,)
+        patcher.model_options["clss_spectrum_h3"] = True
+        print(f"[CLSS] Spectrum forecasting armed: pattern={st.pattern} "
+              f"warmup={st.warmup} tail={st.tail} degree={st.degree} "
+              f"blend={st.blend:g} ridge={st.ridge:g} "
+              f"history={st.max_history} - actual steps capture the "
+              f"post-block hidden state, forecast steps bypass all DiT "
+              f"blocks and keep the FinalLayer modulation exact")
+        return (patcher,)
 
 
 class CLSSH3Guider:
@@ -2660,8 +3054,8 @@ class CLSSH3StreamingSampler:
             elif not is_first and _scene_aud_n > 0:
                 _cfg_g = "audref=off(scene ref)"
             guider_chunk = copy.copy(guider)
-            guider_chunk._step_cache_thresh = float(
-                getattr(clss_config, "step_cache_thresh", 0.0))
+            guider_chunk._step_cache_thresh = _spec_sc_thresh_for(
+                guider, clss_config)
             _cfg_s = f"acfg={getattr(guider_chunk, '_audio_cfg', '?')}"
             if keyframes or _aud_ref_blk is not None or num_scenes > 1:
                 _pos_entry = (_blend_scene_cond(pos_conds[_plan_entry[0]],
@@ -2912,8 +3306,8 @@ class CLSSH3StreamingSampler:
                 else:
                     _rc_guider = copy.copy(guider)
                     _rc_base_conds = guider.original_conds
-                _rc_guider._step_cache_thresh = float(
-                    getattr(clss_config, "step_cache_thresh", 0.0))
+                _rc_guider._step_cache_thresh = _spec_sc_thresh_for(
+                    _rc_guider, clss_config)
                 _rc_aud_in = (aud_out if _margin_af == 0
                               else F.pad(aud_out, (0, _margin_af)))
                 _rc_mask_a = torch.ones(1, 1, lanes_a, _rc_af,
@@ -4037,6 +4431,7 @@ class CLSSH3ReeditChunk(io.ComfyNode):
 NODE_CLASS_MAPPINGS = {
     "CLSSH3Config":           CLSSH3Config,
     "CLSSH3AttentionOverride": CLSSH3AttentionOverride,
+    "CLSSH3SpectrumForecast": CLSSH3SpectrumForecast,
     "CLSSH3AudioConfig":      CLSSH3AudioConfig,
     "CLSSH3ScenePrompts":     CLSSH3ScenePrompts,
     "CLSSH3SceneReference":   CLSSH3SceneReference,
@@ -4053,6 +4448,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CLSSH3Config":           "CLSS H3 Config",
     "CLSSH3AttentionOverride": "CLSS H3 Attention Override (Sage/Flash)",
+    "CLSSH3SpectrumForecast": "CLSS H3 Spectrum Forecast (skip DiT steps)",
     "CLSSH3AudioConfig":      "CLSS H3 Audio Config",
     "CLSSH3ScenePrompts":     "CLSS H3 Scene Prompts",
     "CLSSH3SceneReference":   "CLSS H3 Scene Reference (R2V)",

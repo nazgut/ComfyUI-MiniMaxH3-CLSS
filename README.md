@@ -114,7 +114,7 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 
 | Node | Purpose |
 |---|---|
-| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid); optional experimental knobs, both default 0 (off): `overlap_evict_after` (two-phase overlap eviction) and `step_cache_thresh` (TeaCache-style step skipping) |
+| **CLSS H3 Config** | CLSS hyperparameters (τc, β, overlap on the 5k+2 token grid); optional experimental knobs, both default 0 (off): `overlap_evict_after` (two-phase overlap eviction) and `step_cache_thresh` (skip a DiT forward when the latent has barely moved — the prediction is Taylor-extrapolated along the schedule from the last two computed steps, with a per-tile veto so a calm background can't drag a moving subject through the skip) |
 | **CLSS H3 Audio Config** | All audio settings in one node — recompose steps/σ/arc margin/pool/stride/seed/ref span, head discard and the loop guard (re-rolls, thresholds, rescue ref span, draft screening); wire into the sampler's `audio_config` (the sampler's own audio widgets were removed) |
 | **CLSS H3 Scene Prompts** | Per-scene prompts (split on `---`) → multi-entry CONDITIONING; optional `global_text` prepended to every scene; optional `audio_continuity_text` swapped in only on chunks that carry the continuation ref; stashes raw scene text for the ref nodes |
 | **CLSS H3 Scene Reference (R2V)** | Attach one reference image and/or audio to one scene's conditioning (`<Picture N>` / `<Audio N>` labels) |
@@ -124,13 +124,14 @@ Every input carries an in-UI tooltip with its default behavior and the evidence 
 | **CLSS H3 Re-edit Chunk** | Re-render one chunk of a finished run at its exact original span, head included (context from the frames before it + first/last frame pins copied from the saved video, optional strided video ref of the saved window); outputs `start_frame` / `frames` so the re-render can replace that span in place |
 | **CLSS H3 Load Latent Upscale Model** | Loads a Minimax H3 latent-upscaler (3D) checkpoint from `models/latent_upscale_models` for the sampler's per-chunk upscale; the model code is soft-imported from the Comfyui_Minimax_h3_latent_Upscaler pack at execute time |
 | **CLSS H3 Attention Override (Sage/Flash)** | Run the DiT attention on SageAttention / FlashAttention 2 / xformers — or the stock pytorch / sub-quad backends for A/B — through ComfyUI's `optimized_attention_override` hook; the backend is smoke-tested once and falls back to the stock path with a warning when a package is missing or a call fails mid-run |
+| **CLSS H3 Spectrum Forecast (skip DiT steps)** | Training-free DiT step skipping for turbo runs, adapted from [ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3) (Han et al., [Spectrum paper](https://arxiv.org/abs/2603.01623)): actual steps capture the packed target-stream hidden state right after the last DiT block; forecast steps bypass every DiT block and inject a Chebyshev/linear extrapolation of the anchors before the native FinalLayer — the per-step adaln modulation stays exact. Wire it between the model loader and the CLSS guider; defaults turn a 6-step turbo chunk into A A F A F A (≈50% of DiT evals skipped per chunk). Fail-closed — another plugin's block replacements or a bad fit fall back to real steps |
 | **CLSS H3 Streaming Sampler** | The chunked sampler — SLB via denoise masks, anchor keyframe rows, end-aligned audio seam guide, scene crossfade, optional i2v first-frame guide, optional audio recompose against the finished video, optional per-chunk neural upscale (`upscaler` + `upscale_scale`), corrections, per-chunk telemetry + end-of-run trend summary |
 | **CLSS H3 Guider** | Split video/audio CFG + rescale over the packed AV stream |
 | **CLSS H3 Base Refine Guider (weight-swap)** | Guider for the audio recompose pass that runs on BASE weights without a second checkpoint: clones the turbo model and strips its LoRA patches in a shared-weight copy (ComfyUI re-patches in place on the pass swap); the sampler skips its between-chunks unload |
 | **CLSS H3 Video Decode+Save** | Streaming temporal-slice video decode straight to PNG frames on disk + audio decode |
 
 ```
-UNETLoader → CLSSH3Guider ← CLSSH3ScenePrompts(+) [→ CLSSH3SceneReference(s) per scene] / CLSSH3ScenePrompts(−)
+UNETLoader (+ optional CLSSH3AttentionOverride / CLSSH3SpectrumForecast) → CLSSH3Guider ← CLSSH3ScenePrompts(+) [→ CLSSH3SceneReference(s) per scene] / CLSSH3ScenePrompts(−)
 EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelect, BasicScheduler, RandomNoise)
 → CLSSH3VideoDecodeSave → PNG frames + AUDIO
 ```
@@ -138,7 +139,7 @@ EmptyMiniMaxH3LatentAV → CLSSH3StreamingSampler (+ CLSSH3Config, KSamplerSelec
 ## Repository layout
 
 ```
-nodes.py     # all 14 ComfyUI node implementations
+nodes.py     # all 15 ComfyUI node implementations
 clss.py      # the model-agnostic CLSS algorithm core (SLB, EMA/AdaIN drift correction)
 workflow/    # canonical t2v / i2v / R2V / continue / re-edit workflows — copy them for experiments, don't mutate in place
 ```
@@ -148,6 +149,11 @@ workflow/    # canonical t2v / i2v / R2V / continue / re-edit workflows — copy
 Live-validated on the 16 GB reference stack (int8 convrot DiT, ClipProj Qwen3-VL-4B text encoder, 832×480, 243 px windows, 20 steps, sigma shift 12/6). Audio seam continuity is measured, not guessed: the end-aligned guide takes cross-join correlation from 0.45 to 0.95+, and per-chunk telemetry (`aud_bnd` / `aud_dlv` / `aud_lvl` / …) localizes any remaining seam or drift issues. Defaults are the measured production config — read the tooltips before changing them.
 
 ## Updates
+
+**2026-09-28 — Spectrum forecast: DiT step skipping for turbo runs, step-cache upgrade**
+
+- **`CLSSH3SpectrumForecast`** — training-free hidden-state forecasting adapted to the CLSS loop from [xmarre's ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3) (mechanics cross-checked against that port; nothing vendored), itself a MiniMax H3 port of **Spectrum** — *Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration* by Han et al. ([paper](https://arxiv.org/abs/2603.01623)). Wire it between the model loader and the CLSS guider. On **actual** steps the packed target-stream hidden state is captured right after the last DiT block (CPU-parked anchors); on **forecast** steps every DiT block is bypassed and a Chebyshev/ridge or plain linear extrapolation of the anchors is injected straight into the hidden stream before the native FinalLayer — per-step adaln modulation, denoise-mask rows and unpatchify still run with the exact current-sigma parameters, so only the transformer stack (~99% of step cost) is skipped. Policy per sampling pass: the first `warmup_steps` (2) and last `tail_actual_steps` (1) calls always run for real; `pattern=alternate` (default) forecasts every second step in between — a 6-step turbo chunk runs A A F A F A (~50% of DiT evals skipped per chunk); `consecutive` is the more aggressive classic A A F F F A. Fail-closed: another plugin's DiT block replacements disable forecasting for that model, a wild fit or shape mismatch re-runs the step for real, and a failed anchor capture leaves the model plain.
+- **`step_cache_thresh` upgraded** — a skipped step no longer reuses the stale prediction: it is Taylor-extrapolated along the sigma axis (first-order drift of the two last computed steps), and a **per-tile veto** cancels the skip when the worst 10% of latent tiles moved more than 2.5× the threshold, so a calm background can no longer drag a moving subject through a skip. The first two computed steps of each pass warm up the derivative. When Spectrum is armed on the model the output-level step cache disables itself for it — both skip DiT evals, but Spectrum keeps the per-step modulation exact.
 
 **2026-09-25 — attention override, base refine guider, speed knobs, loop-guard drafts, hardening**
 
@@ -198,3 +204,5 @@ If this node pack is useful to you, you can support its development on Patreon: 
 ## Acknowledgements
 
 Built on [MiniMax H3](https://huggingface.co/Comfy-Org/MiniMax-H3) by MiniMax (weights under the MiniMax H3 Community License — read it before commercial use), [LTX-2](https://github.com/Lightricks/LTX-2) by Lightricks, and the ComfyUI ecosystem.
+
+The `CLSSH3SpectrumForecast` node adapts **Spectrum** — *Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration* by Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo and Stefano Ermon ([paper](https://arxiv.org/abs/2603.01623), [official implementation](https://github.com/hanjq17/Spectrum)) — to the CLSS streaming loop, with the mechanics cross-checked against [xmarre](https://github.com/xmarre)'s ComfyUI MiniMax H3 port: [ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3).
