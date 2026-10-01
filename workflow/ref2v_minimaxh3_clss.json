@@ -42,7 +42,7 @@
   },
   "5": {
     "inputs": {
-      "prompts": "detailed_description:\n[Shot 1] 0–3s: Wide shot. <Subject 1> stands on a rain-slicked rooftop at night, city skyline behind her. She is center-frame, facing camera, hair blowing in wind. <Picture 1> is referenced as visual anchor. She is silent, mouth closed, no lip-sync.\n[Shot 2] 3–7s: Close-up on <Subject 1>'s face. She smirks, eyes catch neon reflections. No singing, no speaking.\n[Shot 3] 7–10s: Camera pulls back. She takes a slow step forward. Pink and blue neon signs flicker in background. Freeze on her confident stance.",
+      "prompts": "detailed_description:\n[Shot 1] 0\u20133s: Wide shot. <Subject 1> stands on a rain-slicked rooftop at night, city skyline behind her. She is center-frame, facing camera, hair blowing in wind. <Picture 1> is referenced as visual anchor. She is silent, mouth closed, no lip-sync.\n[Shot 2] 3\u20137s: Close-up on <Subject 1>'s face. She smirks, eyes catch neon reflections. No singing, no speaking.\n[Shot 3] 7\u201310s: Camera pulls back. She takes a slow step forward. Pink and blue neon signs flicker in background. Freeze on her confident stance.",
       "global_text": "subject_definitions:\n<Subject 1> is the young girl in <Picture 1>, with blonde hair tied back with pink hair clips, blue eyes, light complexion, subtle blush. She wears a light grey zip-up hoodie with pink graphic text, white t-shirt with cartoon cat face, black jogger pants, white chunky sneakers, blue fingerless gloves with dark dots. Confident, mischievous smile.\n\n<Picture 1> is the full-body reference image, used as visual anchor for <Subject 1>'s appearance, clothing, and initial pose.\n\nsummary:\n[reference generation] A 10-second visual-only music video segment. <Subject 1> performs choreographed movement and action in a neon-lit urban night environment. She does NOT sing, does NOT speak, and has NO lip-sync. No vocals, no dialogue. Only visual performance, camera movement, and VFX synchronized to non-diegetic music.\n\nretention_analysis:\n<Picture 1> fully preserved as visual basis. <Subject 1>'s identity, outfit, facial features retained throughout. No singing, no speaking, no lip movement.\n\noverall_soundscape:\nUrban night ambience: distant traffic, soft rain, neon buzz, footsteps on wet surfaces.\n\nnon_diegetic_music:\nDriving synthwave electronic score, heavy bassline, arpeggiated synths, punchy four-on-the-floor beat, fast tempo. Intensity matches visual performance.",
       "clip": [
         "4",
@@ -257,7 +257,12 @@
       "loop_guard_rerolls": 2,
       "loop_guard_wc": 0.99,
       "loop_guard_loop": 0.7,
-      "loop_guard_retry_ref_ms": 2000
+      "loop_guard_retry_ref_ms": 2000,
+      "audio_recompose_scheduler": "beta",
+      "loop_guard_draft_frac": 0.4,
+      "audio_seam_pin": true,
+      "audio_ref_wav_refresh": true,
+      "audio_delivery": "corrected"
     },
     "class_type": "CLSSH3AudioConfig",
     "_meta": {

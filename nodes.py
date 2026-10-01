@@ -231,6 +231,14 @@ def _aud_cos(a: torch.Tensor, b: torch.Tensor) -> float:
         return (fa * fb).sum(dim=1).mean().item()
 
 
+def _sampler_label(s) -> str:
+    if s is None:
+        return "-"
+    fn = getattr(s, "sampler_function", None)
+    return (getattr(fn, "__name__", None) or getattr(s, "name", None)
+            or type(s).__name__)
+
+
 def _aud_flat(t: torch.Tensor) -> torch.Tensor:
     return t.float().reshape(t.shape[0], -1, t.shape[-1])
 
@@ -333,6 +341,7 @@ def _rc_seed_for(audio_recompose_seed: int, noise_seed: int, chunk_idx: int,
 
 _AUDIO_CFG_DEFAULTS = {
     "audio_recompose_steps": 0,
+    "audio_recompose_scheduler": "beta",
     "audio_recompose_sigma": 1.0,
     "audio_arc_margin_ms": 4000,
     "audio_recompose_pool": 2,
@@ -345,6 +354,9 @@ _AUDIO_CFG_DEFAULTS = {
     "loop_guard_loop": 0.70,
     "loop_guard_retry_ref_ms": 2000,
     "loop_guard_draft_frac": 0.4,
+    "audio_seam_pin": True,
+    "audio_ref_wav_refresh": True,
+    "audio_delivery": "corrected",
 }
 _AUDIO_CFG_KEYS = tuple(_AUDIO_CFG_DEFAULTS)
 
@@ -497,7 +509,13 @@ def _mc_fixup_video(layout, refs) -> None:
     if ref.get("kind") not in ("video", "video_audio"):
         raise RuntimeError(
             "Motion Video Context marker must be on a video ref")
-    stride = int(ref[_MC_VIDEO_KEY])
+    _marker = ref[_MC_VIDEO_KEY]
+    if isinstance(_marker, (tuple, list)):
+        stride = int(_marker[0])
+        src_t = int(_marker[1]) if len(_marker) > 1 else None
+    else:
+        stride = int(_marker)
+        src_t = None
     if stride <= 1:
         return
     vt = int(ref.get("latent_t", 0))
@@ -509,17 +527,25 @@ def _mc_fixup_video(layout, refs) -> None:
     if n % vt:
         raise RuntimeError("Motion Video Context row count changed")
     frame_rows = n // vt
+    # anti-aliased decimation pairs with group-CENTER placement: each kept
+    # token is the mean of its whole stride group, so it belongs at the
+    # group's time center - placing it at the group's first frame would bias
+    # every sync cue ~half a group early (its own desync)
     origin = _mc_target_origin(layout)
     off = 0.0
     f = 0
     for k in range(vt):
-        desired = origin + FRAME_RESCALE * off
+        group = (stride if src_t is None or f + stride <= src_t
+                 else max(1, src_t - f))
+        span = 0.0
+        for _ in range(group):
+            span += FRAME_PER_TOKEN[f % 5]
+            f += 1
+        desired = origin + FRAME_RESCALE * (off + 0.5 * span)
         current = float(layout.position_ids[a + k * frame_rows, 0])
         layout.position_ids[a + k * frame_rows: a + (k + 1) * frame_rows, 0] += (
             desired - current)
-        for _ in range(stride):
-            off += FRAME_PER_TOKEN[f % 5]
-            f += 1
+        off += span
 
 
 def _evict_fixup(layout, keyframes) -> None:
@@ -542,6 +568,30 @@ def _evict_fixup(layout, keyframes) -> None:
     # offset_px, because the 2 kept overlap rows sit at phases 0/1 (1+4 px) —
     # so a single uniform shift restores every row's true window time
     layout.position_ids[a:b, 0] += FRAME_RESCALE * offset_px
+
+
+def _temporal_decimate(z: torch.Tensor, stride: int) -> torch.Tensor:
+    # anti-aliased temporal decimation: AVERAGE each stride group instead of
+    # keeping every Nth frame. Plain ::stride decimation drops frames raw -
+    # fast transients (hits, lip closures, cuts) that live in 1-2 frames
+    # vanish phase-dependently and apparent motion between kept tokens
+    # multiplies, so the model reads event timing from an aliased signal and
+    # the take's audio drifts off the video. Averaging keeps every source
+    # frame's information at the same token count; the Motion Context fixup
+    # positions each kept token at its group's true time center.
+    stride = max(1, int(stride))
+    if stride <= 1:
+        return z
+    t = int(z.shape[2])
+    full = (t // stride) * stride
+    if full <= 0:
+        return z
+    out = z[:, :, :full].reshape(
+        *z.shape[:2], full // stride, stride, *z.shape[3:]).mean(dim=3)
+    if full < t:
+        out = torch.cat([out, z[:, :, full:].mean(dim=2, keepdim=True)],
+                        dim=2)
+    return out
 
 
 def _mc_apply_patch() -> bool:
@@ -593,16 +643,20 @@ def _mc_apply_patch() -> bool:
         patched_init(probe, 7, 8, 2, 2, 16,
                      refs=[{"kind": "video", "latent_t": 4, "latent_h": 2,
                             "latent_w": 2, "ref_audio_t": 0,
-                            _MC_VIDEO_KEY: 2}])
+                            _MC_VIDEO_KEY: (2, 8)}])
         a, b = _mc_ref_map(probe, [{"kind": "video", "latent_t": 4,
                                     "latent_h": 2, "latent_w": 2,
                                     "ref_audio_t": 0}])[0]["ref_img"]
         va, vb, _vk = probe.segments[-1]
         if b - a != 4 or vb - va != 8:
             raise RuntimeError("Motion Video Context self-test row count")
+        _cum = [0.0]
+        for _j in range(8):
+            _cum.append(_cum[-1] + mm.FRAME_PER_TOKEN[_j % 5])
         for _k in range(4):
-            if abs(float(probe.position_ids[a + _k, 0])
-                   - float(probe.position_ids[va + 2 * _k, 0])) > 1e-6:
+            _mid = (float(probe.position_ids[va, 0]) + mm.FRAME_RESCALE
+                    * 0.5 * (_cum[2 * _k] + _cum[2 * _k + 2]))
+            if abs(float(probe.position_ids[a + _k, 0]) - _mid) > 1e-6:
                 raise RuntimeError(
                     "Motion Video Context self-test position mismatch")
         probe = mm.PackedLayout.__new__(mm.PackedLayout)
@@ -683,8 +737,12 @@ class CLSSH3AudioConfig:
         return {
             "required": {
                 "audio_recompose_steps": ("INT", {
-                    "default": 0, "min": 0, "max": 30,
+                    "default": 0, "min": 0, "max": 60,
                     "tooltip": "Recompose pass against the finished video: the chunk's audio is replaced by a take from the audio_refine_guider model (wire the BASE model, not the turbo LoRA). The take generates its window plus audio_arc_margin_ms of extra audio that is not delivered, and the finished chunk video rides as a downscaled frozen video reference, so the pack shrinks greatly and each step is fast. 0 = off.",
+                    }),
+                "audio_recompose_scheduler": (["beta", "linspace", "karras", "exponential", "simple"], {
+                    "default": "beta",
+                    "tooltip": "Sigma spacing of the recompose pass. beta (default, best telemetry): U-shaped in timestep space - through the audio shift it lands ~29/40 steps in the sigma>0.5 structure band; measured zero loop-guard re-rolls and the smoothest seams. linspace = uniform, also good. WARNING: karras on this 0..1 flow schedule collapses ~29/40 steps into the sigma<0.1 polish band (4 structure steps) and produces noticeably worse music - do not use.",
                     }),
                 "audio_recompose_sigma": ("FLOAT", {
                     "default": 1.0, "min": 0.50, "max": 1.0, "step": 0.05,
@@ -696,11 +754,11 @@ class CLSSH3AudioConfig:
                     }),
                 "audio_recompose_pool": ("INT", {
                     "default": 2, "min": 1, "max": 4, "step": 1,
-                    "tooltip": 'Spatial downscale of the chunk-video reference before packing. 2 = quarter of the video ref tokens; 4 = 1/16 (fastest, coarsest motion cue); 1 = full-res ref (~4x the tokens of pool 2). The ref is cropped to a 2xpool multiple first so patchify never sees an odd dim.',
+                    "tooltip": 'Spatial downscale of the chunk-video reference before packing. Anti-aliased (2x2 averaging, nothing dropped) and position-safe - it costs fine spatial detail (lips, stick hits) but never bends event timing. 2 = quarter of the video ref tokens (default); 4 = 1/16 (fastest, coarsest detail); 1 = full-res ref (~4x the tokens of pool 2). The ref is cropped to a 2xpool multiple first so patchify never sees an odd dim.',
                     }),
                 "audio_recompose_stride": ("INT", {
                     "default": 2, "min": 1, "max": 5, "step": 1,
-                    "tooltip": "Temporal stride over the reference's latent frames. 2 halves the ref tokens (~12 latent fps, ~0.3 s resolution) with the kept frames re-spaced onto the target time grid, so the ref still covers the full window at true time. 1 = every latent frame (tightest sync cues, 2x the ref tokens).",
+                    "tooltip": "Temporal decimation of the reference's latent frames. Anti-aliased: each stride group is AVERAGED rather than every Nth frame kept, so no source frame's motion or transient information is lost (raw ::stride decimation aliases fast events into wrong times - the model then times beats/hits/lip transients off the video), and each kept token is positioned at its group's true time center. 2 = half the ref tokens at ~12 latent fps with full information coverage (default); 1 = every latent frame (max fidelity, 2x the ref tokens). Forced back to 1 with a warning if the Motion Context layout patch is unavailable, because an unpositioned strided ref would play at 2x speed in the pack.",
                     }),
                 "audio_recompose_seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
@@ -734,6 +792,18 @@ class CLSSH3AudioConfig:
                     "default": 0.4, "min": 0.0, "max": 0.9, "step": 0.05,
                     "tooltip": "Speculative draft screening for loop-guard re-rolls: every attempt first runs this fraction of the recompose steps as a cheap draft, the draft's x0 estimate is screened with the same aud_wc/aud_loop metrics, and only drafts that already measure as looping are abandoned early (a rejected draft costs the draft steps instead of a full take). Good drafts are continued on the rest of the schedule from their own x0 re-noised with the same seed, so an accepted attempt costs exactly one take as before. 0 = off. Needs loop_guard_rerolls > 0 and >= 3 recompose steps.",
                     }),
+                "audio_seam_pin": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Seam pin: the recompose window's overlap span is frozen to the actually-delivered tail latent (noise_mask 0), so the take is generated as a direct continuation of the delivered audio instead of re-imagining the overlap and being hard-spliced at the join. Removes the per-join phase/timbre/groove discontinuity that accumulates into an audible glitch. Off = legacy splice behaviour.",
+                    }),
+                "audio_ref_wav_refresh": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Audio ref waveform refresh. On (legacy): every chunk's continuity/recompose audio ref is decoded, re-normalized and RE-ENCODED through the audio VAE - one lossy VAE generation injected into the conditioning chain at every join, and each chunk composes its tone/level from that degraded context (a candidate mechanism for the per-join artifact accumulation; the model also sees a slightly different signal than what is actually delivered at the seam). Off: the as-delivered corrected latent rides as the ref directly - zero VAE round-trips, the model continues from exactly what the export decodes. A/B this if joins dull/smear more with every chunk.",
+                    }),
+                "audio_delivery": (["corrected", "raw"], {
+                    "default": "corrected",
+                    "tooltip": "Delivery correction stack. corrected (legacy): every chunk passes the delivery DSP chain before export - waveform loudness anchor, tanh peak soft-clip, aud_rms scene-ref gain, aud_tail level ramp, per-channel spectral gains. All of it is per-chunk DSP on the latent that the audio VAE decoder never trained on, and the corrected result feeds forward into the next chunk's pin/refs - a prime suspect when quality decays join over join while the raw model takes measure fine. raw: the take is delivered EXACTLY as the model + seam pin produced it (telemetry, chunk-1 fade-in, splice and loop guard untouched). Bisect: if raw joins are clean where corrected joins degrade, the correction stack is the artifact source; if raw degrades the same way, the decay lives in the continuation conditioning itself and no delivery DSP will fix it.",
+                    }),
             },
         }
     RETURN_TYPES = ("CLSS_AUDIO_CONFIG",)
@@ -747,9 +817,13 @@ class CLSSH3AudioConfig:
               audio_recompose_ref_ms=0, audio_head_discard_ms=0,
               loop_guard_rerolls=2, loop_guard_wc=0.99,
               loop_guard_loop=0.70, loop_guard_retry_ref_ms=2000,
-              loop_guard_draft_frac=0.4):
+              loop_guard_draft_frac=0.4,
+              audio_recompose_scheduler="beta",
+              audio_seam_pin=True, audio_ref_wav_refresh=True,
+              audio_delivery="corrected"):
         return ({
             "audio_recompose_steps": audio_recompose_steps,
+            "audio_recompose_scheduler": audio_recompose_scheduler,
             "audio_recompose_sigma": audio_recompose_sigma,
             "audio_arc_margin_ms": audio_arc_margin_ms,
             "audio_recompose_pool": audio_recompose_pool,
@@ -762,6 +836,9 @@ class CLSSH3AudioConfig:
             "loop_guard_loop": loop_guard_loop,
             "loop_guard_retry_ref_ms": loop_guard_retry_ref_ms,
             "loop_guard_draft_frac": loop_guard_draft_frac,
+            "audio_seam_pin": audio_seam_pin,
+            "audio_ref_wav_refresh": audio_ref_wav_refresh,
+            "audio_delivery": audio_delivery,
         },)
 
 
@@ -1110,7 +1187,8 @@ def _recut_scene_audio_windows(pos_conds: list, cum_px: list[int],
 def _build_audio_ref_block(audio_tail: torch.Tensor, span_px: float = 0.0,
                            end_px: float | None = None,
                            audio_vae=None,
-                           device=None) -> tuple[dict | None, str]:
+                           device=None,
+                           wav_refresh: bool = True) -> tuple[dict | None, str]:
     if audio_tail is None or audio_tail.shape[-1] <= 0 or span_px <= 0:
         return None, ""
     wanted = int(round(span_px / float(_NATIVE_FPS) * AUDIO_LATENT_FPS))
@@ -1118,7 +1196,7 @@ def _build_audio_ref_block(audio_tail: torch.Tensor, span_px: float = 0.0,
         return None, ""
     src = "lat"
     z = None
-    if audio_vae is not None:
+    if audio_vae is not None and wav_refresh:
         try:
             z_in = audio_tail.to(device) if device is not None else audio_tail
             wav = audio_vae.decode(z_in)
@@ -1134,6 +1212,22 @@ def _build_audio_ref_block(audio_tail: torch.Tensor, span_px: float = 0.0,
             if enc is not None and enc.ndim == 4 and enc.shape[-1] > 0:
                 z = enc
                 src = "wav"
+                # Unity-level round-trip: the std-normalize above targets the
+                # model's operating level, which lands below the previous
+                # chunk's delivered level whenever the music is loud — and the
+                # next chunk re-normalizes from THAT quieter ref, compounding
+                # ~2 dB of loudness loss per chunk (chunk 1 ends up louder
+                # than the rest of the song). Re-anchor the encoded ref to the
+                # RMS of the delivered tail window it was decoded from.
+                _tail_win = (audio_tail[..., -wanted:]
+                             if audio_tail.shape[-1] > wanted else audio_tail)
+                _src_rms = _tail_win.float().pow(2).mean().sqrt()
+                _enc_rms = z.float().pow(2).mean().sqrt()
+                if float(_enc_rms) > 1e-8 and float(_src_rms) > 1e-8:
+                    _lvl = float((_src_rms / _enc_rms).clamp(0.5, 2.0))
+                    if abs(_lvl - 1.0) > 0.02:
+                        z = z * _lvl
+                        src = f"wav(lvl x{_lvl:.2f})"
         except Exception as exc:
             print(f"[CLSS] WARNING: audio-ref waveform refresh failed "
                   f"({exc!r}); falling back to the delivered latent.")
@@ -2533,6 +2627,9 @@ class CLSSH3StreamingSampler:
                 "audio_refine_guider": ("GUIDER", {
                     "tooltip": "Separate GUIDER for the audio recompose pass: wire a CLSSH3Guider built on the BASE model (no LoRA), with the same conditioning as the main guider - or a CLSSH3BaseRefineGuider wired to the SAME LoRA model as the main guider, which strips the LoRA in a shared-weight clone and hot-swaps instead of loading a second checkpoint. Only used when the audio config's recompose steps > 0.",
                     }),
+                "audio_recompose_sampler": ("SAMPLER", {
+                    "tooltip": "Sampler for the audio recompose pass. Unwired, the recompose inherits the MAIN sampler - which is usually picked for the 6-step turbo take (plain euler). A 20-40 step base-model take converges much better on a higher-order solver: wire a KSamplerSelect with dpmpp_2m, res_multistep or dpmpp_2m_sde for noticeably cleaner music/SFX at the same step count.",
+                    }),
                 "scene_handoff": (["transition_chunk", "blend", "hard"], {
                     "default": "transition_chunk",
                     "tooltip": "How text conditioning changes at a scene boundary. transition_chunk: two-step crossfade straddling the boundary (outgoing scene's last chunk 25%-incoming, incoming scene's first chunk 75%-incoming; every scene block needs >= 2 chunks). blend: single 50/50 blend on the first chunk of the new scene. hard: plain text swap.",
@@ -2573,6 +2670,7 @@ class CLSSH3StreamingSampler:
         audio_join_lead_ms: int = 0,
         scene_handoff: str = "transition_chunk",
         audio_refine_guider=None,
+        audio_recompose_sampler=None,
         tail_margin_px: int = 12,
         continuation_context=None,
     ):
@@ -2597,6 +2695,7 @@ class CLSSH3StreamingSampler:
         _aud = _resolve_audio_settings(audio_config)
         audio_head_discard_ms = int(_aud["audio_head_discard_ms"])
         audio_recompose_steps = int(_aud["audio_recompose_steps"])
+        audio_recompose_scheduler = str(_aud["audio_recompose_scheduler"])
         audio_recompose_sigma = float(_aud["audio_recompose_sigma"])
         audio_arc_margin_ms = int(_aud["audio_arc_margin_ms"])
         audio_recompose_pool = int(_aud["audio_recompose_pool"])
@@ -2608,6 +2707,9 @@ class CLSSH3StreamingSampler:
         loop_guard_loop = float(_aud["loop_guard_loop"])
         loop_guard_retry_ref_ms = int(_aud["loop_guard_retry_ref_ms"])
         loop_guard_draft_frac = float(_aud["loop_guard_draft_frac"])
+        audio_seam_pin = bool(_aud["audio_seam_pin"])
+        audio_ref_wav_refresh = bool(_aud["audio_ref_wav_refresh"])
+        _raw_delivery = str(_aud["audio_delivery"]) == "raw"
         _tm_px_in = max(0, min(48, int(tail_margin_px)))
         _tm_lf, _tm_px = _tail_margin_tokens(tail_margin_px)
         _tm_af = int(round(_tm_px * FRAME_RESCALE)) if _tm_px > 0 else 0
@@ -2851,6 +2953,14 @@ class CLSSH3StreamingSampler:
               f"{getattr(guider, '_video_cfg', '?')} a="
               f"{getattr(guider, 'audio_cfg', '?')} rescale="
               f"{getattr(guider, '_rescale', '?')}")
+        print("[CLSS] audio config: "
+              + " ".join(f"{k}={_aud[k]}" for k in _AUDIO_CFG_KEYS))
+        _rc_smp = (sampler if audio_recompose_sampler is None
+                   else audio_recompose_sampler)
+        print(f"[CLSS] audio recompose sampler: {_sampler_label(_rc_smp)}"
+              + (" (explicit audio_recompose_sampler input)"
+                 if audio_recompose_sampler is not None
+                 else f" (inherited from main: {_sampler_label(sampler)})"))
         if _up_active:
             _up_note = (" [CPU — fp32 fallback, expect very slow]"
                         if _up_dev.type == "cpu" else "")
@@ -2924,6 +3034,7 @@ class CLSSH3StreamingSampler:
         clss_state = CLSSState(clss_config)
         acc_video: list[torch.Tensor] = []
         acc_audio: list[torch.Tensor] = []
+        _anchor_gains: list[float] = []
         acc_video_hr: list[torch.Tensor] = []
         _up_secs = 0.0
         audio_chunk_ends: list[int] = []
@@ -2950,6 +3061,17 @@ class CLSSH3StreamingSampler:
         _lg_draft_aborts_total = 0
         _lg_draft_saved_total = 0
         _s1_audio_freq_ref: list[float] | None = None
+        _prev_aud_wav_rms: float | None = None
+        # audio_delivery="raw" disables the whole delivery-correction stack
+        # (waveform level anchor, tanh peak clip, aud_rms/aud_tail scene-ref
+        # gains, per-channel spectral gains): the take is exported exactly as
+        # the model + seam pin produced it. Raw mode is the bisection
+        # baseline for per-join decay - if raw joins stay clean where
+        # corrected joins degrade, the delivery DSP is the artifact source;
+        # if raw degrades identically, the decay lives in the take /
+        # continuation conditioning itself, not in delivery.
+        _anchor_on = (audio_recompose_steps > 0 and audio_vae is not None
+                      and not _raw_delivery)
         _trend = {
             "vid_std": [], "vid_intra": [], "vid_bnd": [],
             "vid_hf": [], "vid_origin": [],
@@ -2990,6 +3112,15 @@ class CLSSH3StreamingSampler:
                 _origin_layout = None
                 _s1_prev_vfeat = None
                 _slb_std_base = None  # don't lock scene N's overlap seed to scene 1's contrast
+                # don't lock scene N's AUDIO to scene 1's profile either:
+                # these refs anchor the aud_rms/aud_tail/aud_spec delivery
+                # corrections, so left stale they drag every later scene's
+                # music back to scene 1's loudness and spectrum - and fight
+                # the waveform anchor (which correctly tracks the PREVIOUS
+                # chunk, keeping inter-chunk level continuity across the cut)
+                _s1_aud_rms_ref = None
+                _s1_aud_level_ref = None
+                _s1_audio_freq_ref = None
                 _hist_scene_start = len(acc_audio)
                 clss_state.reset_drift_refs()
             _prev_scene_idx = scene_idx
@@ -3048,7 +3179,8 @@ class CLSSH3StreamingSampler:
                 _aud_ref_blk, _aud_src = _build_audio_ref_block(
                     _audio_tail, span_px=_span_px,
                     end_px=float(px_ol),
-                    audio_vae=audio_vae, device=device)
+                    audio_vae=audio_vae, device=device,
+                    wav_refresh=audio_ref_wav_refresh)
                 _cfg_g = (f"audref={_aud_ref_blk['ref_audio_t'] if _aud_ref_blk else 0}"
                           f"af({_aud_src or 'lat'})")
             elif not is_first and _scene_aud_n > 0:
@@ -3261,14 +3393,25 @@ class CLSSH3StreamingSampler:
             if audio_recompose_steps > 0:
                 _rc_pool = max(1, int(audio_recompose_pool))
                 _rc_stride = max(1, int(audio_recompose_stride))
+                if _rc_stride > 1 and not _mc_apply_patch():
+                    # a strided video ref WITHOUT the position fixup plays at
+                    # stride-x speed in the pack: the take syncs to that and
+                    # lands off the real video. Never feed it unpositioned.
+                    print("[CLSS] WARNING: audio_recompose_stride > 1 needs "
+                          "the Motion Context layout patch, which failed its "
+                          "self-test on this ComfyUI build - forcing stride 1 "
+                          "(a compressed-timeline video ref would desync the "
+                          "take from the video).")
+                    _rc_stride = 1
                 _vr = _vid_full if _vid_full is not None else vid_out
                 if _rc_pool > 1:
                     _m = 2 * _rc_pool
                     _vr = _vr[..., :(_vr.shape[-2] // _m) * _m,
                               :(_vr.shape[-1] // _m) * _m]
                     _vr = F.avg_pool3d(_vr, (1, _rc_pool, _rc_pool))
+                _rc_src_t = int(_vr.shape[2])
                 if _rc_stride > 1:
-                    _vr = _vr[:, :, ::_rc_stride]
+                    _vr = _temporal_decimate(_vr, _rc_stride)
                 _rc_vid = {
                     "kind": "video",
                     "latent_t": int(_vr.shape[2]),
@@ -3278,8 +3421,8 @@ class CLSSH3StreamingSampler:
                     "latent": _vr.contiguous(),
                     "audio_latent": None,
                 }
-                if _rc_stride > 1 and _mc_apply_patch():
-                    _rc_vid[_MC_VIDEO_KEY] = int(_rc_stride)
+                if _rc_stride > 1:
+                    _rc_vid[_MC_VIDEO_KEY] = (int(_rc_stride), _rc_src_t)
                 _rc_w = 2 * max(1, round(W / H))
                 _margin_af = max(0, int(round(audio_arc_margin_ms
                                               * AUDIO_LATENT_FPS / 1000.0)))
@@ -3312,6 +3455,28 @@ class CLSSH3StreamingSampler:
                               else F.pad(aud_out, (0, _margin_af)))
                 _rc_mask_a = torch.ones(1, 1, lanes_a, _rc_af,
                                         device=device)
+                # Seam pin: freeze the overlap span's audio lanes at the
+                # actually-delivered tail latent (noise_mask 0), so the take
+                # is generated as a direct continuation of the delivered
+                # audio instead of re-imagining the overlap span and getting
+                # hard-spliced at the join. The join's phase/timbre/groove
+                # discontinuity - which compounded into an audible glitch at
+                # every seam and then rode the next chunk's ref forward - is
+                # removed at the source: the model itself generates through
+                # the seam. The video lanes already pin the same way (mask 0
+                # to the dummy), so this only extends a proven path. Delivery
+                # still cuts at _d_af, so lengths and A/V sync are untouched.
+                _pin_af = 0
+                if (audio_seam_pin and not is_first and _scene_aud_n == 0
+                        and _d_af > 0 and acc_audio
+                        and int(acc_audio[-1].shape[-1]) >= _d_af):
+                    _pin_af = int(_d_af)
+                    _rc_aud_in = _rc_aud_in.clone()
+                    _rc_aud_in[..., :_pin_af] = acc_audio[-1][
+                        ..., -_pin_af:].to(device=device,
+                                           dtype=_rc_aud_in.dtype)
+                    _rc_mask_a = _rc_mask_a.clone()
+                    _rc_mask_a[..., :_pin_af] = 0.0
                 _rc_pe = (_blend_scene_cond(pos_conds[_plan_entry[0]],
                                             pos_conds[_plan_entry[1]],
                                             _plan_entry[2])
@@ -3328,7 +3493,8 @@ class CLSSH3StreamingSampler:
                         _audio_tail,
                         span_px=float(audio_recompose_ref_ms) / 1000.0 * fps,
                         end_px=float(px_ol),
-                        audio_vae=audio_vae, device=device)
+                        audio_vae=audio_vae, device=device,
+                        wav_refresh=audio_ref_wav_refresh)
                 _rc_pe["minimax_refs"] = (
                     list(_rc_pe.get("minimax_refs") or [])
                     + [_rc_vid]
@@ -3338,8 +3504,25 @@ class CLSSH3StreamingSampler:
                 _rc_guider.original_conds = {
                     **_rc_base_conds, "positive": [_rc_pe]}
                 _sigma_rc = float(audio_recompose_sigma)
-                _rcs = torch.linspace(_sigma_rc, 0.0,
-                                      audio_recompose_steps + 1)
+                if audio_recompose_scheduler == "linspace":
+                    _rcs = torch.linspace(_sigma_rc, 0.0,
+                                          audio_recompose_steps + 1)
+                else:
+                    try:
+                        _ms = _rc_guider.model_patcher.get_model_object(
+                            "model_sampling")
+                        _rcs = comfy.samplers.calculate_sigmas(
+                            _ms, audio_recompose_scheduler,
+                            audio_recompose_steps).float()
+                        _rcs = _rcs * (_sigma_rc
+                                       / max(float(_rcs[0]), 1e-8))
+                        _rcs[-1] = 0.0
+                    except Exception as _exc_rcs:
+                        print(f"[CLSS] WARNING: audio recompose scheduler "
+                              f"'{audio_recompose_scheduler}' unavailable "
+                              f"({_exc_rcs!r}); falling back to linspace.")
+                        _rcs = torch.linspace(_sigma_rc, 0.0,
+                                              audio_recompose_steps + 1)
                 _full_tok = total_lf * (H // 2) * (W // 2)
                 _rc_tok = (int(_vr.shape[2]) * (_vr.shape[3] // 2)
                            * (_vr.shape[4] // 2)
@@ -3348,13 +3531,14 @@ class CLSSH3StreamingSampler:
                       f"{audio_recompose_steps} steps from sigma "
                       f"{_sigma_rc:.2f} ("
                       f"{'refine of the joint take' if _sigma_rc < 0.999 else 'fresh take'}"
-                      f", seed {_rc_seed}) | pack {_rc_tok} video-side "
+                      f", seed {_rc_seed}, sched {audio_recompose_scheduler}) | pack {_rc_tok} video-side "
                       f"tokens vs {_full_tok} full "
                       f"(~{_full_tok / max(_rc_tok, 1):.0f}x fewer) | "
                       f"ref {_vr.shape[2]}f@{_vr.shape[3]}x{_vr.shape[4]} "
                       f"pool x{_rc_pool} stride {_rc_stride} | arc margin "
                       f"{audio_arc_margin_ms}ms ({_margin_af}af) | acfg="
                       f"{float(getattr(_rc_guider, 'audio_cfg', 0.0)):.1f}"
+                      + (f" | pin {_pin_af}af" if _pin_af > 0 else "")
                       + (f" | audref {_rc_aud_ref_blk['ref_audio_t']}af({_rc_src or 'lat'}"
                          + (f", span {int(audio_recompose_ref_ms)}ms"
                             if int(audio_recompose_ref_ms) > 0 else "")
@@ -3380,7 +3564,8 @@ class CLSSH3StreamingSampler:
                         _audio_tail,
                         span_px=float(loop_guard_retry_ref_ms) / 1000.0 * fps,
                         end_px=float(px_ol),
-                        audio_vae=audio_vae, device=device)
+                        audio_vae=audio_vae, device=device,
+                        wav_refresh=audio_ref_wav_refresh)
                     if _lg_ref_blk is not None:
                         _lg_refs_retry = (
                             [b for b in _rc_pe["minimax_refs"]
@@ -3404,7 +3589,9 @@ class CLSSH3StreamingSampler:
                             _rc_mask_a)),
                     }
                     _, _ro = SamplerCustomAdvanced().sample(
-                        noise=_nz, guider=_rc_guider, sampler=sampler,
+                        noise=_nz, guider=_rc_guider,
+                        sampler=(sampler if audio_recompose_sampler is None
+                                 else audio_recompose_sampler),
                         sigmas=(_rcs if _sigmas is None else _sigmas),
                         latent_image=_lat)
                     return _ro["samples"].unbind()[1]
@@ -3458,6 +3645,15 @@ class CLSSH3StreamingSampler:
                                       _init_aud=_draft_x0)
                              if _draft_x0 is not None
                              else _rc_take(_seed_shot))
+                    if _pin_af > 0 and _lg_shot == 0:
+                        _pin_d = float((_take[..., :_pin_af].float()
+                                        - _rc_aud_in[..., :_pin_af].float()
+                                        ).abs().max())
+                        print(f"[CLSS] chunk {chunk_idx + 1}: seam pin check "
+                              f"max|take-pin|={_pin_d:.6f} "
+                              + ("(pinned)"
+                                 if _pin_d < 1e-3
+                                 else "(MASK IGNORED - pin not applied!)"))
                     _wc = _lp = float("nan")
                     if _lg_on:
                         _wc, _lp = _take_loop_metrics(
@@ -3513,6 +3709,46 @@ class CLSSH3StreamingSampler:
                                     f"{int(loop_guard_retry_ref_ms)}ms]")
                     print(_lg_msg)
                 aud_out = _lg_tries[_lg_i][3][..., :_win_af]
+                _lvl_gain = 1.0
+                # Waveform loudness anchor. Latent RMS stays flat even while
+                # the decoded waveform gets quieter chunk over chunk (the
+                # model composes a thinner/quieter mix as it continues —
+                # measured -2 dB/chunk in decode_save with flat latent RMS),
+                # so the level chain must be measured in the WAVEFORM domain.
+                # Decode the picked take, RMS the region that is actually
+                # delivered (past the overlap cut, before the tail margin),
+                # and gain-match it to the previous chunk's delivered
+                # waveform. +/-3 dB clamp so genuine swells/drops still pass.
+                # The first chunk sets the song's level.
+                # The gain is NOT applied to the latent: a gained delivered
+                # latent feeds straight back into the next chunk's seam pin
+                # and ref chain and inflates the conditioning level chunk
+                # over chunk (measured: delivered latent RMS climbing
+                # 0.48 -> 0.85 over 5 chunks, every take muddier than the
+                # last). It is recorded and applied to the chunk's waveform
+                # region at export instead (decode_save), so level matching
+                # happens entirely outside the conditioning chain.
+                if (not _raw_delivery and audio_vae is not None
+                        and _win_af > 8):
+                    try:
+                        _lvl_wav = audio_vae.decode(aud_out)
+                        _lvl_T = int(_lvl_wav.shape[1])
+                        _lvl_lo = int(_lvl_T * min(max(int(_d_af), 0),
+                                         _win_af - 1) / _win_af)
+                        _lvl_hi = max(_lvl_lo + 8,
+                                      int(_lvl_T * max(_win_af - int(_tm_af),
+                                          1) / _win_af))
+                        _lvl_rms = float(_lvl_wav[:, _lvl_lo:_lvl_hi, :]
+                                         .float().pow(2).mean().sqrt())
+                        del _lvl_wav
+                        if _lvl_rms > 1e-8:
+                            if _prev_aud_wav_rms is not None:
+                                _lvl_gain = max(0.7, min(1.4,
+                                    _prev_aud_wav_rms / _lvl_rms))
+                    except Exception as _exc_lvl:
+                        print(f"[CLSS] WARNING: audio level anchor failed "
+                              f"({_exc_lvl!r}); chunk level unanchored.")
+                _anchor_gains.append(_lvl_gain)
                 if audio_refine_guider is not None:
                     _swap_of = getattr(audio_refine_guider,
                                        "_clss_weight_swap_of", None)
@@ -3546,7 +3782,9 @@ class CLSSH3StreamingSampler:
                 print(f"[CLSS] chunk {chunk_idx + 1}: recompose took "
                       f"{_dt_rc:.1f}s ({_dt_rc / audio_recompose_steps:.2f}s/"
                       f"step) | audio vs turbo take cos={_rcm_cos:.3f} rms "
-                      f"x{_rcm_rms:.2f}")
+                      f"x{_rcm_rms:.2f}"
+                      + (f" | lvl x{_lvl_gain:.2f}"
+                         if abs(_lvl_gain - 1.0) > 0.02 else ""))
 
             _src_off = ((0 if _evict_head else 2) if _vid_full is not None
                         else chunk_overlap - _head_lf)
@@ -3666,12 +3904,13 @@ class CLSSH3StreamingSampler:
                     _ramp = torch.linspace(0.125, 1.0, _n_fade, device=device)
                     new_aud = new_aud.clone()
                     new_aud[..., :_n_fade] = new_aud[..., :_n_fade] * _ramp
-            _fa = new_aud.float()
-            _sig = _fa.std(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-            _over = (_fa.abs() - _sig * 3.5).clamp(min=0)
-            new_aud = (_fa - torch.sign(_fa)
-                       * (_over - 1.5 * _sig
-                          * torch.tanh(_over / (1.5 * _sig)))).to(aud_out.dtype)
+            if not _raw_delivery:
+                _fa = new_aud.float()
+                _sig = _fa.std(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+                _over = (_fa.abs() - _sig * 3.5).clamp(min=0)
+                new_aud = (_fa - torch.sign(_fa)
+                           * (_over - 1.5 * _sig
+                              * torch.tanh(_over / (1.5 * _sig)))).to(aud_out.dtype)
             _fa2 = new_aud.float()
             _trend["aud_peak"].append(float(
                 _fa2.abs().max() / _fa2.std().clamp(min=1e-8)))
@@ -3685,7 +3924,7 @@ class CLSSH3StreamingSampler:
                 _s1_aud_rms_ref = _cur_arms
                 if _s1_aud_level_ref is None:
                     _s1_aud_level_ref = _cur_arms
-            else:
+            elif not _raw_delivery:
                 _ratio_a = _s1_aud_rms_ref / max(_cur_arms, 1e-6)
                 if _ratio_a < 0.94 or _ratio_a > 1.06:
                     _g_a = 1.0 + 0.5 * (_ratio_a - 1.0)
@@ -3695,7 +3934,8 @@ class CLSSH3StreamingSampler:
             _trend["aud_rms"].append(_cur_arms)
             _tail_n = min(int(round(_TAIL_ANCHOR_S * AUDIO_LATENT_FPS)),
                           new_aud.shape[-1])
-            if _tail_n > 0 and _s1_aud_level_ref is not None:
+            if (not _raw_delivery and _tail_n > 0
+                    and _s1_aud_level_ref is not None):
                 _tail = new_aud[..., -_tail_n:]
                 _t_rms = float(_tail.float().pow(2).mean().sqrt().item())
                 if _t_rms > 1e-9:
@@ -3726,15 +3966,16 @@ class CLSSH3StreamingSampler:
                 _hi_r = sum(_s1_audio_freq_ref[-4:]) / 4.0
                 _g_lo = min(1.12, max(0.90, _lo_r / max(_lo_e, 1e-6)))
                 _g_hi = min(1.20, max(0.90, _hi_r / max(_hi_e, 1e-6)))
-                _l_sp = (_g_lo, _g_hi)
-                if abs(_g_lo - 1.0) > 0.005 or abs(_g_hi - 1.0) > 0.005:
-                    _gt = torch.ones(1, _n_ch, 1, 1, dtype=new_aud.dtype,
-                                     device=new_aud.device)
-                    _gt[0, :-4] = _g_lo
-                    _gt[0, -4:] = _g_hi
-                    new_aud = (new_aud * _gt).to(new_aud.dtype)
-                    _freq_e = [_e * (_g_hi if _i >= _n_ch - 4 else _g_lo)
-                               for _i, _e in enumerate(_freq_e)]
+                if not _raw_delivery:
+                    _l_sp = (_g_lo, _g_hi)
+                    if abs(_g_lo - 1.0) > 0.005 or abs(_g_hi - 1.0) > 0.005:
+                        _gt = torch.ones(1, _n_ch, 1, 1, dtype=new_aud.dtype,
+                                         device=new_aud.device)
+                        _gt[0, :-4] = _g_lo
+                        _gt[0, -4:] = _g_hi
+                        new_aud = (new_aud * _gt).to(new_aud.dtype)
+                        _freq_e = [_e * (_g_hi if _i >= _n_ch - 4 else _g_lo)
+                                   for _i, _e in enumerate(_freq_e)]
                 _freq_ratio = [e / r if r > 1e-6 else 0.0
                                for e, r in zip(_freq_e, _s1_audio_freq_ref)]
                 if len(_freq_ratio) >= 4:
@@ -3773,6 +4014,25 @@ class CLSSH3StreamingSampler:
                         _loop_t + sum(a.shape[-1]
                                       for a in acc_audio[:_hist_scene_start])
                         / AUDIO_LATENT_FPS)
+            if _anchor_on and new_aud.shape[-1] > 8:
+                # anchor target for the NEXT chunk: the as-delivered tail end,
+                # measured after every correction above (pre-correction storage
+                # let the corrections and the anchor chase each other). The
+                # export-only level gain is part of the delivered level, so
+                # the next take is compared against clean RMS x gain.
+                try:
+                    _lvl_n = min(int(new_aud.shape[-1]),
+                                 max(int(_d_af),
+                                     int(round(2.0 * AUDIO_LATENT_FPS))))
+                    _lvl_tw = audio_vae.decode(
+                        new_aud[..., -_lvl_n:].to(device))
+                    _lvl_T2 = int(_lvl_tw.shape[1])
+                    _prev_aud_wav_rms = float(
+                        _lvl_tw[:, _lvl_T2 // 4:, :].float()
+                        .pow(2).mean().sqrt()) * _lvl_gain
+                    del _lvl_tw
+                except Exception:
+                    pass
             acc_audio.append(new_aud.cpu())
             audio_chunk_ends.append(sum(a.shape[-1] for a in acc_audio))
             _s1_aud_prev_last = new_aud[..., -1:].cpu()
@@ -3884,6 +4144,7 @@ class CLSSH3StreamingSampler:
             _splice["join_af_exact"].append(_cum_px * float(FRAME_RESCALE))
         _splice["total_af_exact"] = (
             sum(int(_cf[2]) for _cf in chunk_plan) * float(FRAME_RESCALE))
+        _splice["lvl_gains"] = list(_anchor_gains)
         return ({"samples": output_samples,
                  "clss_audio_chunk_ends": list(audio_chunk_ends),
                  "clss_audio_splice": _splice,
@@ -3932,13 +4193,20 @@ def _splice_delivered_audio(audio: torch.Tensor, splice: dict,
         print(f"[CLSS] decode_save: seam splice skipped \u2014 decoded audio "
               f"{total} smp < expected {_acc}")
         return audio
-    parts = [audio[..., :starts[1]]]
+    gains = [float(_g) for _g in splice.get("lvl_gains") or []]
+    if len(gains) != len(lens):
+        gains = [1.0] * len(lens)
+    if any(abs(_g - 1.0) > 1e-3 for _g in gains):
+        print("[CLSS] decode_save: level-anchor export gains "
+              + " ".join(f"x{_g:.2f}" for _g in gains)
+              + " (export only - conditioning chain untouched)")
+    parts = [audio[..., :starts[1]] * gains[0]]
     repaired = 0
     blended = 0
     for i in range(1, len(lens)):
         s = starts[i]
         e = starts[i + 1] if i + 1 < len(lens) else total
-        seg = audio[..., s:e]
+        seg = audio[..., s:e] * gains[i]
         h = heads[i] if i < len(heads) else 0
         f = fills[i - 1] if i - 1 < len(fills) else 0
         ok = (h > 0 and 0 <= f <= h and int(seg.shape[-1]) > h
@@ -3946,12 +4214,17 @@ def _splice_delivered_audio(audio: torch.Tensor, splice: dict,
         if ok:
             x = h - f
             if x > 0 and parts[-1].shape[-1] >= x and int(seg.shape[-1]) > x:
-                _w = torch.linspace(0.0, 1.0, x, device=audio.device,
-                                    dtype=torch.float32)
+                # equal-power crossfade: the two sides are phase-mismatched
+                # independent takes, for which a linear-gain blend dips up to
+                # -3 dB at the centre; sin/cos keeps seam power constant
+                _w = (torch.linspace(0.0, 1.0, x, device=audio.device,
+                                     dtype=torch.float32)
+                      * (math.pi / 2.0))
                 _a = parts[-1][..., -x:].float()
                 _b = seg[..., :x].float()
                 parts[-1] = parts[-1][..., :-x]
-                parts.append((_a * (1.0 - _w) + _b * _w).to(audio.dtype))
+                parts.append((_a * torch.cos(_w)
+                              + _b * torch.sin(_w)).to(audio.dtype))
                 blended += x
             parts.append(seg[..., x:])
             repaired += 1
@@ -4274,14 +4547,15 @@ def _video_ref_block(vae, clip_frames: torch.Tensor, pool: int,
         m = 2 * pool
         z = z[..., :(z.shape[-2] // m) * m, :(z.shape[-1] // m) * m]
         z = F.avg_pool3d(z, (1, pool, pool))
+    _src_t = int(z.shape[2])
     if stride > 1:
-        z = z[:, :, ::stride]
+        z = _temporal_decimate(z, stride)
     blk = {"kind": "video", "latent_t": int(z.shape[2]),
            "latent_h": int(z.shape[3]), "latent_w": int(z.shape[4]),
            "ref_audio_t": 0, "latent": z.contiguous(),
            "audio_latent": None}
     if stride > 1:
-        blk[_MC_VIDEO_KEY] = stride
+        blk[_MC_VIDEO_KEY] = (stride, _src_t)
     return blk
 
 

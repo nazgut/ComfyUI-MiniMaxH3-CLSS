@@ -272,7 +272,12 @@
       "loop_guard_rerolls": 2,
       "loop_guard_wc": 0.99,
       "loop_guard_loop": 0.7,
-      "loop_guard_retry_ref_ms": 2000
+      "loop_guard_retry_ref_ms": 2000,
+      "audio_recompose_scheduler": "beta",
+      "loop_guard_draft_frac": 0.4,
+      "audio_seam_pin": true,
+      "audio_ref_wav_refresh": true,
+      "audio_delivery": "corrected"
     },
     "class_type": "CLSSH3AudioConfig",
     "_meta": {
